@@ -20,6 +20,9 @@ msg_info "Configuring AIClient2API"
 umask 077
 mkdir -p /opt/aiclient2api-data/configs /opt/aiclient2api-data/plugins-user /opt/aiclient2api-data/logs
 cp -a /opt/aiclient2api/configs/. /opt/aiclient2api-data/configs/
+cp -n /opt/aiclient2api-data/configs/provider_pools.json.example /opt/aiclient2api-data/configs/provider_pools.json
+cp -n /opt/aiclient2api-data/configs/custom_models.json.example /opt/aiclient2api-data/configs/custom_models.json
+install -m 600 /dev/null /opt/aiclient2api-data/configs/input_system_prompt.txt
 API_KEY="$(openssl rand -hex 32)"
 UI_PASSWORD="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-24)"
 cat <<EOF >/opt/aiclient2api-data/configs/config.json
