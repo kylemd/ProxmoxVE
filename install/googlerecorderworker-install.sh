@@ -52,6 +52,7 @@ install -d -m 0700 -o google-recorder -g google-recorder \
   /var/lib/google-recorder/.config/google-recorder \
   /var/lib/google-recorder/browser-profile \
   /var/lib/google-recorder/tmp
+chown -R google-recorder:google-recorder /var/lib/google-recorder
 install -d -m 0750 -o root -g google-recorder /etc/google-recorder-worker
 msg_ok "Created Service Account"
 
