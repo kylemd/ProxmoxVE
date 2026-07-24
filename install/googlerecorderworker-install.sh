@@ -17,7 +17,6 @@ msg_info "Installing Dependencies"
 $STD apt-get install -y \
   dbus-x11 \
   jq \
-  novnc \
   openbox \
   openssl \
   websockify \
@@ -37,6 +36,10 @@ rm -f /etc/apt/sources.list.d/google-chrome.list
 msg_ok "Installed Chrome"
 
 NODE_VERSION="22" setup_nodejs
+
+msg_info "Installing noVNC"
+$STD apt-get install -y novnc
+msg_ok "Installed noVNC"
 
 msg_info "Creating Service Account"
 useradd \
