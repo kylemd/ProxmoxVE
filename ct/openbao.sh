@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-source <(curl -fsSL https://raw.githubusercontent.com/kylemd/ProxmoxVE/codex/test-openbao-script/misc/build.func)
+source <(curl -fsSL https://raw.githubusercontent.com/kylemd/ProxmoxVE/95219ee113bad6cf951be50136530dc590debafc/misc/build.func)
 # Copyright (c) 2021-2026 community-scripts ORG
 # Author: Kyle (kylemd)
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
