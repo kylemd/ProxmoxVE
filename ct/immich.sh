@@ -110,7 +110,7 @@ EOF
     msg_ok "Image-processing libraries up to date"
   fi
 
-  RELEASE="v3.0.3"
+  RELEASE="v3.1.0"
   if check_for_gh_release "Immich" "immich-app/immich" "${RELEASE}" "each release is tested individually before the version is updated. Please do not open issues for this"; then
     if [[ $(cat ~/.immich) > "2.5.1" ]]; then
       msg_info "Enabling Maintenance Mode"
@@ -214,7 +214,16 @@ EOF
     cd "$SRC_DIR"
     export MISE_TRUSTED_CONFIG_PATHS="$SRC_DIR"/mise.toml
     export MISE_DISABLE_TOOLS=github:jellyfin/jellyfin-ffmpeg
-    $STD mise install
+    mise_ok=0
+    for i in 1 2 3; do
+      $STD mise install && {
+        mise_ok=1
+        break
+      }
+      msg_warn "mise install failed (attempt $i/3) - retrying"
+      sleep 5
+    done
+    [[ "$mise_ok" -eq 1 ]] || exit 1
     export PATH="$(mise bin-paths 2>/dev/null | tr '\n' ':')$PATH"
     if ! command -v extism-js >/dev/null 2>&1; then
       # extism-js ships as a bare gzip-compressed single binary (.gz) that
@@ -310,6 +319,7 @@ EOF
     grep -rl /usr/src | xargs -n1 sed -i "s|\/usr/src|$INSTALL_DIR|g"
     grep -rlE "'/build'" | xargs -n1 sed -i "s|'/build'|'$APP_DIR'|g"
     sed -i "s@\"/cache\"@\"$INSTALL_DIR/cache\"@g" "$ML_DIR"/immich_ml/config.py
+    [[ ! -f "$GEO_DIR/countryInfo.txt" ]] && curl_with_retry "https://download.geonames.org/export/dump/countryInfo.txt" "countryInfo.txt"
     ln -s "${UPLOAD_DIR:-/opt/immich/upload}" "$APP_DIR"/upload
     ln -s "${UPLOAD_DIR:-/opt/immich/upload}" "$ML_DIR"/upload
     ln -s "$GEO_DIR" "$APP_DIR"

@@ -30,6 +30,7 @@ function update_script() {
     exit
   fi
 
+  ensure_dependencies git
   if check_for_gh_release "sparkyfitness" "CodeWithCJ/SparkyFitness"; then
     msg_info "Stopping Services"
     systemctl stop sparkyfitness-server nginx
@@ -93,7 +94,8 @@ EOF
     msg_ok "Refreshed SparkyFitness Service"
 
     msg_info "Starting Services"
-    $STD systemctl start sparkyfitness-server nginx
+    $STD systemctl start sparkyfitness-server
+    nginx_enable_site sparkyfitness
     msg_ok "Started Services"
     msg_ok "Updated successfully!"
   fi

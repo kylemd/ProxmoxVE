@@ -78,6 +78,8 @@ $STD yarn config set enableTelemetry 0
 export NODE_OPTIONS="--max-old-space-size=4096"
 export TSC_COMPILE_ON_ERROR=true
 $STD yarn install
+$STD bash ./scripts/set-version.sh "$(cat ~/.affine_app)"
+export BUILD_TYPE=stable
 $STD npm install -g typescript
 $STD yarn affine @affine/native build
 $STD yarn affine @affine/server-native build
@@ -207,9 +209,7 @@ server {
     }
 }
 EOF
-ln -sf /etc/nginx/sites-available/affine.conf /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default
-systemctl enable -q --now nginx
+nginx_enable_site affine.conf
 msg_ok "Configured Nginx"
 
 motd_ssh

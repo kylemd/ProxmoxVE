@@ -25,7 +25,8 @@ $STD apt install -y \
   rrdtool \
   snmp \
   snmpd \
-  whois
+  whois \
+  ipmitool
 msg_ok "Installed Dependencies"
 
 msg_info "Installing Python Dependencies"
@@ -80,7 +81,7 @@ sed -i "s/listen = \/run\/php\/php8.4-fpm.sock/listen = \/run\/php-fpm-librenms.
 msg_ok "Configured PHP-FPM"
 
 msg_info "Configure Nginx"
-cat <<EOF >/etc/nginx/sites-enabled/librenms
+cat <<EOF >/etc/nginx/sites-available/librenms
 server {
  listen      80;
  server_name ${LOCAL_IP};
@@ -103,8 +104,7 @@ server {
  }
 }
 EOF
-rm /etc/nginx/sites-enabled/default
-$STD systemctl reload nginx
+nginx_enable_site librenms
 systemctl restart php8.4-fpm
 msg_ok "Configured Nginx"
 

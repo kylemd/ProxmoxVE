@@ -42,7 +42,7 @@ function update_script() {
       echo -e ""
       msg_custom "🔄" "Migration required to new data structure (/opt/paperless_data/)"
       msg_custom "📖" "Please follow the migration guide:"
-      echo -e "${GATEWAY}${BGN}https://github.com/community-scripts/ProxmoxVE/discussions/9223${CL}"
+      echo -e "${GATEWAY}${BGN}https://github.com/community-scripts/ProxmoxVE/pull/9223${CL}"
       echo -e ""
       msg_custom "⚠️" "Update aborted. Please migrate your data first."
       exit 253
@@ -65,7 +65,7 @@ function update_script() {
       read -rp "Do you want to continue with the update? (y/N): " MIGRATE
       echo
       if [[ ! "$MIGRATE" =~ ^[Yy]$ ]]; then
-        msg_info "Update aborted. Decrypt all documents before upgrading to v3."
+        msg_custom "⚠️" "Update aborted. Decrypt all documents before upgrading to v3."
         exit 0
       fi
     fi
@@ -166,6 +166,8 @@ function update_script() {
       msg_info "Updating Paperless-ngx"
       if ((BRIDGE_UPDATE == 0)); then
         sed -i 's|^ExecStart=.*|ExecStart=uv run -- granian --interface asginl --ws --loop uvloop "paperless.asgi:application"|' /etc/systemd/system/paperless-webserver.service
+        grep -q "document_index reindex" /etc/systemd/system/paperless-webserver.service ||
+          sed -i '/^ExecStart=/i ExecStartPre=uv run -- python manage.py document_index reindex --if-needed --no-progress-bar' /etc/systemd/system/paperless-webserver.service
         $STD systemctl daemon-reload
       fi
       cd /opt/paperless

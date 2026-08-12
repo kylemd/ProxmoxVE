@@ -54,7 +54,7 @@ cd /opt
 rm -rf /opt/guacamole-server
 msg_ok "Built Guacamole Server (guacd)"
 
-NODE_VERSION="24" setup_nodejs
+NODE_VERSION="26" setup_nodejs
 fetch_and_deploy_gh_release "termix" "Termix-SSH/Termix" "tarball"
 
 msg_info "Building Frontend"
@@ -125,7 +125,7 @@ EOF
 
 cat <<EOF >/opt/termix/.env
 NODE_ENV=production
-DATA_DIR=/opt/termix/data
+DATA_DIR=/opt/termix/db/data
 GUACD_HOST=127.0.0.1
 GUACD_PORT=4822
 EOF

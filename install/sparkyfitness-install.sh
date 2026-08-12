@@ -14,7 +14,7 @@ network_check
 update_os
 
 msg_info "Installing Dependencies"
-$STD apt install -y nginx
+$STD apt install -y git nginx
 msg_ok "Installed Dependencies"
 
 PG_VERSION="18" setup_postgresql
@@ -91,11 +91,7 @@ sed \
   -e 's|root /usr/share/nginx/html;|root /var/www/sparkyfitness;|g' \
   -e 's|server_name localhost;|server_name _;|g' \
   "/opt/sparkyfitness/docker/nginx.conf" >/etc/nginx/sites-available/sparkyfitness
-ln -sf /etc/nginx/sites-available/sparkyfitness /etc/nginx/sites-enabled/sparkyfitness
-rm -f /etc/nginx/sites-enabled/default
-$STD nginx -t
-$STD systemctl enable -q --now nginx
-$STD systemctl reload nginx
+nginx_enable_site sparkyfitness
 msg_ok "Configured Nginx"
 
 motd_ssh

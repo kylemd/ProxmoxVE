@@ -27,8 +27,8 @@ function update_script() {
     msg_error "No ${APP} Installation Found!"
     exit
   fi
-  if ! command -v node >/dev/null || [[ "$(/usr/bin/env node -v | grep -oP '^v\K[0-9]+')" != "22" ]]; then
-    NODE_VERSION="22" NODE_MODULE="pnpm@$(curl -s https://raw.githubusercontent.com/docmost/docmost/main/package.json | jq -r '.packageManager | split("@")[1]')" setup_nodejs
+  if ! command -v node >/dev/null || [[ "$(/usr/bin/env node -v | grep -oP '^v\K[0-9]+')" != "26" ]]; then
+    NODE_VERSION="26" NODE_MODULE="pnpm@$(curl -s https://raw.githubusercontent.com/docmost/docmost/main/package.json | jq -r '.packageManager | split("@")[1]')" setup_nodejs
   fi
   export NODE_OPTIONS="--max_old_space_size=4096"
 
@@ -37,9 +37,9 @@ function update_script() {
     systemctl stop docmost
     msg_ok "Stopped Service"
 
-    create_backup /opt/docmost/.env \
-      /opt/docmost/data
-    fetch_and_deploy_gh_release "docmost" "docmost/docmost" "tarball"
+    create_backup /opt/docmost/.env /opt/docmost/data
+    
+    CLEAN_INSTALL=1 fetch_and_deploy_gh_release "docmost" "docmost/docmost" "tarball"
 
     restore_backup
 
