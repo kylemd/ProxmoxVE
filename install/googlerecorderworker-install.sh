@@ -85,9 +85,15 @@ const port = Number(process.env.WORKER_PORT || 8787);
 const token = process.env.WORKER_TOKEN;
 const cli = '/usr/local/bin/google-recorder-run';
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const workerMaxListLimit = parseWorkerMaxListLimit(process.env.WORKER_MAX_LIST_LIMIT);
 let queue = Promise.resolve();
 
 if (!token) throw new Error('WORKER_TOKEN is required');
+
+function parseWorkerMaxListLimit(value) {
+  const limit = Number(value);
+  return Number.isSafeInteger(limit) && (limit === 100 || limit === 1000) ? limit : 100;
+}
 
 function sendJson(response, statusCode, body) {
   const payload = Buffer.from(JSON.stringify(body));
@@ -165,7 +171,7 @@ const server = createServer(async (request, response) => {
 
     if (request.method === 'GET' && requestUrl.pathname === '/v1/recordings') {
       const requestedLimit = Number(requestUrl.searchParams.get('limit') || 25);
-      const limit = Math.max(1, Math.min(100, Number.isFinite(requestedLimit) ? requestedLimit : 25));
+      const limit = Math.max(1, Math.min(workerMaxListLimit, Number.isSafeInteger(requestedLimit) ? requestedLimit : 25));
       try {
         const { stdout } = await runCli(['list', '--limit', String(limit), '--json']);
         return sendJson(response, 200, { recordings: JSON.parse(stdout) });
@@ -298,6 +304,7 @@ cat <<EOF >/etc/google-recorder-worker/worker.env
 WORKER_HOST=0.0.0.0
 WORKER_PORT=8787
 WORKER_TOKEN=${worker_token}
+WORKER_MAX_LIST_LIMIT=100
 REAUTH_CONSOLE_URL=http://$(hostname -I | awk '{print $1}'):6080/vnc.html?autoconnect=true&resize=remote
 EOF
 chmod 0640 /etc/google-recorder-worker/worker.env
@@ -312,6 +319,80 @@ EOF
 chmod 0600 /root/google-recorder-worker-credentials
 unset worker_token vnc_password
 msg_ok "Created Credentials"
+
+msg_info "Installing Worker Limit Control"
+cat <<'EOF' >/usr/local/sbin/googlerecorderworker-limit
+#!/usr/bin/env bash
+set -euo pipefail
+
+limit="${1:-}"
+env_file="/etc/google-recorder-worker/worker.env"
+service="google-recorder-worker"
+
+if [[ "$#" -ne 1 || ( "$limit" != "100" && "$limit" != "1000" ) ]]; then
+  printf 'Usage: %s {100|1000}\n' "${0##*/}" >&2
+  exit 64
+fi
+
+if [[ ! -f "$env_file" ]]; then
+  printf 'Google Recorder worker environment is missing.\n' >&2
+  exit 1
+fi
+
+temp_file="$(mktemp "${env_file}.new.XXXXXX")"
+rollback_file="$(mktemp "${env_file}.rollback.XXXXXX")"
+trap 'rm -f "$temp_file" "$rollback_file"' EXIT
+cp -- "$env_file" "$rollback_file"
+chown root:google-recorder "$rollback_file"
+chmod 0640 "$rollback_file"
+
+awk -v value="$limit" '
+  /^WORKER_MAX_LIST_LIMIT=/ {
+    if (!updated++) print "WORKER_MAX_LIST_LIMIT=" value
+    next
+  }
+  { print }
+  END {
+    if (!updated) print "WORKER_MAX_LIST_LIMIT=" value
+  }
+' "$env_file" >"$temp_file"
+
+chown root:google-recorder "$temp_file"
+chmod 0640 "$temp_file"
+mv "$temp_file" "$env_file"
+trap - EXIT
+
+if systemctl restart "$service"; then
+  for _ in {1..15}; do
+    if curl -fsS http://127.0.0.1:8787/health >/dev/null; then
+      rm -f "$rollback_file"
+      printf 'Google Recorder worker list ceiling: %s\n' "$limit"
+      exit 0
+    fi
+    sleep 1
+  done
+fi
+
+mv "$rollback_file" "$env_file"
+chown root:google-recorder "$env_file"
+chmod 0640 "$env_file"
+if systemctl restart "$service"; then
+  for _ in {1..15}; do
+    if curl -fsS http://127.0.0.1:8787/health >/dev/null; then
+      printf 'Google Recorder worker health check failed; previous ceiling configuration restored.\n' >&2
+      exit 1
+    fi
+    sleep 1
+  done
+fi
+
+printf 'Google Recorder worker health check failed and recovery health could not be confirmed; previous ceiling configuration was restored.\n' >&2
+exit 1
+EOF
+chmod 0755 /usr/local/sbin/googlerecorderworker-limit
+chown root:root /usr/local/sbin/googlerecorderworker-limit
+ln -sfn /usr/local/sbin/googlerecorderworker-limit /usr/local/bin/googlerecorderworker-limit
+msg_ok "Installed Worker Limit Control"
 
 msg_info "Creating Services"
 cat <<'EOF' >/etc/systemd/system/google-recorder-display.service
@@ -452,6 +533,16 @@ systemctl enable -q --now \
   google-recorder-novnc \
   google-recorder-auth.path \
   google-recorder-worker
+for _ in {1..15}; do
+  if curl -fsS http://127.0.0.1:8787/health >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+if ! curl -fsS http://127.0.0.1:8787/health >/dev/null; then
+  msg_error "Google Recorder worker health check failed"
+  exit 1
+fi
 msg_ok "Created Services"
 
 motd_ssh
