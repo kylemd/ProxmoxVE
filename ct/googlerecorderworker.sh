@@ -108,7 +108,10 @@ const server = createServer(async (request, response) => {
   const requestUrl = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
 
   if (request.method === 'GET' && requestUrl.pathname === '/health') {
-    return sendJson(response, 200, { status: 'ok' });
+    return sendJson(response, 200, {
+      status: 'ok',
+      worker_max_list_limit: workerMaxListLimit,
+    });
   }
 
   if (!isAuthorized(request)) {
@@ -209,12 +212,36 @@ if [[ ! -f "$env_file" ]]; then
   exit 1
 fi
 
+read_effective_limit() {
+  local health_response effective_limit
+  health_response="$(curl -fsS http://127.0.0.1:8787/health)" || return 1
+  effective_limit="$(sed -nE 's/.*"worker_max_list_limit"[[:space:]]*:[[:space:]]*(1000|100).*/\1/p' <<<"$health_response")"
+  [[ "$effective_limit" == "100" || "$effective_limit" == "1000" ]] || return 1
+  printf '%s\n' "$effective_limit"
+}
+
+wait_for_effective_limit() {
+  local expected_limit="$1" effective_limit
+  for _ in {1..15}; do
+    if effective_limit="$(read_effective_limit)" && [[ "$effective_limit" == "$expected_limit" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+prior_effective_limit=""
+if prior_effective_limit="$(read_effective_limit)"; then
+  :
+else
+  prior_effective_limit=""
+fi
+
 temp_file="$(mktemp "${env_file}.new.XXXXXX")"
 rollback_file="$(mktemp "${env_file}.rollback.XXXXXX")"
 trap 'rm -f "$temp_file" "$rollback_file"' EXIT
-cp -- "$env_file" "$rollback_file"
-chown root:google-recorder "$rollback_file"
-chmod 0640 "$rollback_file"
+cp -p -- "$env_file" "$rollback_file"
 
 awk -v value="$limit" '
   /^WORKER_MAX_LIST_LIMIT=/ {
@@ -230,33 +257,36 @@ awk -v value="$limit" '
 chown root:google-recorder "$temp_file"
 chmod 0640 "$temp_file"
 mv "$temp_file" "$env_file"
-trap - EXIT
 
-if systemctl restart "$service"; then
-  for _ in {1..15}; do
-    if curl -fsS http://127.0.0.1:8787/health >/dev/null; then
-      rm -f "$rollback_file"
-      printf 'Google Recorder worker list ceiling: %s\n' "$limit"
-      exit 0
+restore_prior_state() {
+  local restore_status=0
+  if ! mv "$rollback_file" "$env_file"; then
+    printf 'Google Recorder worker ceiling rollback could not restore the previous environment.\n' >&2
+    return 1
+  fi
+  if ! systemctl restart "$service"; then
+    printf 'Google Recorder worker ceiling rollback could not restart the worker.\n' >&2
+    return 1
+  fi
+  if [[ -n "$prior_effective_limit" ]]; then
+    if wait_for_effective_limit "$prior_effective_limit"; then
+      printf 'Google Recorder worker previous effective ceiling restored: %s\n' "$prior_effective_limit" >&2
+    else
+      printf 'Google Recorder worker ceiling rollback restarted the worker but could not confirm the previous effective ceiling.\n' >&2
+      restore_status=1
     fi
-    sleep 1
-  done
+  fi
+  return "$restore_status"
+}
+
+if systemctl restart "$service" && wait_for_effective_limit "$limit"; then
+  rm -f "$rollback_file"
+  printf 'Google Recorder worker list ceiling: %s\n' "$limit"
+  exit 0
 fi
 
-mv "$rollback_file" "$env_file"
-chown root:google-recorder "$env_file"
-chmod 0640 "$env_file"
-if systemctl restart "$service"; then
-  for _ in {1..15}; do
-    if curl -fsS http://127.0.0.1:8787/health >/dev/null; then
-      printf 'Google Recorder worker health check failed; previous ceiling configuration restored.\n' >&2
-      exit 1
-    fi
-    sleep 1
-  done
-fi
-
-printf 'Google Recorder worker health check failed and recovery health could not be confirmed; previous ceiling configuration was restored.\n' >&2
+printf 'Google Recorder worker requested ceiling was not confirmed; restoring the previous configuration.\n' >&2
+restore_prior_state || true
 exit 1
 EOF
   chmod 0755 /usr/local/sbin/googlerecorderworker-limit

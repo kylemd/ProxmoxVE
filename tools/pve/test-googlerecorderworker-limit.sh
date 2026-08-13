@@ -12,22 +12,35 @@ ENV_FILE="$TEST_ROOT/worker.env"
 HELPER="$TEST_ROOT/googlerecorderworker-limit"
 INSTALLER_HELPER="$TEST_ROOT/installer-helper"
 UPDATER_HELPER="$TEST_ROOT/updater-helper"
+INSTALLER_SERVER="$TEST_ROOT/installer-server.mjs"
+UPDATER_SERVER="$TEST_ROOT/updater-server.mjs"
 CALLS="$TEST_ROOT/calls"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 mkdir -p "$BIN"
 
-extract_limit_helper() {
-  local source="$1"
-  awk -v marker="cat <<'EOF' >/usr/local/sbin/googlerecorderworker-limit" '
+extract_heredoc() {
+  local source="$1" marker="$2"
+  awk -v marker="$marker" '
     $0 ~ "^[[:space:]]*" marker "$" { capture=1; next }
     capture && $0 ~ "^[[:space:]]*EOF$" { exit }
     capture { print }
   ' "$source"
 }
 
-extract_limit_helper "$INSTALLER" >"$INSTALLER_HELPER"
-extract_limit_helper "$UPDATER" >"$UPDATER_HELPER"
+extract_heredoc "$INSTALLER" "cat <<'EOF' >/usr/local/sbin/googlerecorderworker-limit" >"$INSTALLER_HELPER"
+extract_heredoc "$UPDATER" "cat <<'EOF' >/usr/local/sbin/googlerecorderworker-limit" >"$UPDATER_HELPER"
 cmp -s "$INSTALLER_HELPER" "$UPDATER_HELPER"
+extract_heredoc "$INSTALLER" "cat <<'EOF' >/opt/google-recorder-worker/server.mjs" >"$INSTALLER_SERVER"
+extract_heredoc "$UPDATER" "cat <<'EOF' >/opt/google-recorder-worker/server.mjs" >"$UPDATER_SERVER"
+cmp -s "$INSTALLER_SERVER" "$UPDATER_SERVER"
+grep -Fqx '      worker_max_list_limit: workerMaxListLimit,' "$INSTALLER_SERVER"
+if command -v node >/dev/null 2>&1; then
+  node --input-type=module --check <"$INSTALLER_SERVER"
+  node --input-type=module --check <"$UPDATER_SERVER"
+elif command -v node.exe >/dev/null 2>&1; then
+  node.exe --input-type=module --check <"$INSTALLER_SERVER"
+  node.exe --input-type=module --check <"$UPDATER_SERVER"
+fi
 
 grep -qx 'WORKER_MAX_LIST_LIMIT=100' "$INSTALLER"
 [[ $(grep -c '^WORKER_MAX_LIST_LIMIT=100$' "$INSTALLER") -eq 1 ]]
@@ -61,7 +74,24 @@ printf '%s\n' "$*" >>"${PHS_TEST_CALLS:?}"
 EOF
 cat >"$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
-[[ "${PHS_TEST_HEALTH:-ok}" == "ok" ]]
+set -euo pipefail
+
+case "${PHS_TEST_HEALTH_MODE:-match}" in
+  match)
+    effective_limit="$(awk -F= '/^WORKER_MAX_LIST_LIMIT=/ { value=$2 } END { print value }' "${PHS_TEST_ENV_FILE:?}")"
+    ;;
+  mismatch)
+    # A requested 1000 remains reported as 100 until the rollback restores 100.
+    effective_limit=100
+    ;;
+  unavailable)
+    exit 22
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+printf '{"status":"ok","worker_max_list_limit":%s}\n' "$effective_limit"
 EOF
 cat >"$BIN/sleep" <<'EOF'
 #!/usr/bin/env bash
@@ -80,6 +110,9 @@ write_env() {
     'WORKER_MAX_LIST_LIMIT=100' \
     'REAUTH_CONSOLE_URL=http://127.0.0.1:6080/vnc.html' \
     >"$ENV_FILE"
+  if [[ "${1:-}" == "duplicate" ]]; then
+    printf '%s\n' 'WORKER_MAX_LIST_LIMIT=1000' >>"$ENV_FILE"
+  fi
 }
 
 assert_env() {
@@ -92,42 +125,56 @@ assert_env() {
 }
 
 run_helper() {
-  PATH="$BIN:$PATH" PHS_TEST_CALLS="$CALLS" PHS_TEST_HEALTH="${PHS_TEST_HEALTH:-ok}" \
-    "$HELPER" "$@"
+  PATH="$BIN:$PATH" PHS_TEST_CALLS="$CALLS" PHS_TEST_ENV_FILE="$ENV_FILE" \
+    PHS_TEST_HEALTH_MODE="${1:?health mode required}" \
+    "$HELPER" "${@:2}"
 }
 
-write_env
+write_env duplicate
 : >"$CALLS"
-output=$(run_helper 1000)
+output=$(run_helper match 1000)
 grep -qx 'Google Recorder worker list ceiling: 1000' <<<"$output"
 assert_env 1000
 grep -qx 'restart test-google-recorder-worker' "$CALLS"
 
-output=$(run_helper 100)
+output=$(run_helper match 100)
 grep -qx 'Google Recorder worker list ceiling: 100' <<<"$output"
 assert_env 100
 [[ $(wc -l <"$CALLS") -eq 2 ]]
 
 before_invalid=$(sha256sum "$ENV_FILE" | awk '{print $1}')
 before_calls=$(wc -l <"$CALLS")
-if run_helper 500 >/dev/null 2>&1; then
+if run_helper match 500 >/dev/null 2>&1; then
   printf '%s\n' 'expected unsupported limit to fail' >&2
   exit 1
 fi
-if run_helper 100 extra >/dev/null 2>&1; then
+if run_helper match 100 extra >/dev/null 2>&1; then
   printf '%s\n' 'expected extra argument to fail' >&2
   exit 1
 fi
 [[ $(sha256sum "$ENV_FILE" | awk '{print $1}') == "$before_invalid" ]]
 [[ $(wc -l <"$CALLS") -eq "$before_calls" ]]
 
-PHS_TEST_HEALTH=fail
-if run_helper 1000 >/dev/null 2>&1; then
+write_env
+: >"$CALLS"
+if mismatch_output=$(run_helper mismatch 1000 2>&1); then
+  printf '%s\n' 'expected effective-ceiling mismatch to fail' >&2
+  exit 1
+fi
+grep -Fq 'requested ceiling was not confirmed' <<<"$mismatch_output"
+grep -Fq 'previous effective ceiling restored: 100' <<<"$mismatch_output"
+assert_env 100
+[[ $(wc -l <"$CALLS") -eq 2 ]]
+[[ $(grep -c '^restart test-google-recorder-worker$' "$CALLS") -eq 2 ]]
+
+write_env
+: >"$CALLS"
+if run_helper unavailable 1000 >/dev/null 2>&1; then
   printf '%s\n' 'expected health failure to return non-success' >&2
   exit 1
 fi
 assert_env 100
-[[ $(wc -l <"$CALLS") -eq 4 ]]
-[[ $(grep -c '^restart test-google-recorder-worker$' "$CALLS") -eq 4 ]]
+[[ $(wc -l <"$CALLS") -eq 2 ]]
+[[ $(grep -c '^restart test-google-recorder-worker$' "$CALLS") -eq 2 ]]
 
 printf '%s\n' 'Google Recorder worker limit contract tests passed'
