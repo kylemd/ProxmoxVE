@@ -281,61 +281,132 @@ function detect_service() {
   rm -rf "$tmpdir"
 }
 
-function dry_run_container() {
-  local container="$1"
-  local service="$2"
-  local mode_label="REPORT-ONLY"
+function valid_report_version() {
+  [[ "$1" =~ ^[[:alnum:]][[:alnum:].+~:_-]*$ ]]
+}
 
-  # Extract app name and source repo directly from check_for_gh_release call in the ct script
+function report_gh_release() {
+  local container="$1" service="$2" mode_label="REPORT-ONLY"
   # Pattern: check_for_gh_release "appname" "owner/repo"
-  local check_line app_name app_lc source_repo
-  check_line=$(echo "$script" | grep -m1 'check_for_gh_release')
+  local check_line app_name app_lc source_repo current_version latest_version
+  check_line=$(grep -m1 'check_for_gh_release' <<<"$script" || true)
+  [[ -n "$check_line" ]] || {
+    DRY_RUN_RESULT="unsupported update metadata: no check_for_gh_release declaration"
+    return 65
+  }
 
-  if [[ -z "$check_line" ]]; then
-    echo -e "${YW}[${mode_label}]${CL} Container $container ($service): no check_for_gh_release found — skipping"
-    DRY_RUN_RESULT="no check_for_gh_release found — skipping"
-    return
+  app_name=$(cut -d'"' -f2 <<<"$check_line")
+  source_repo=$(cut -d'"' -f4 <<<"$check_line")
+  app_lc=$(tr -d ' ' <<<"${app_name,,}")
+  if [[ -z "$app_lc" || ! "$source_repo" =~ ^[[:alnum:]._-]+/[[:alnum:]._-]+$ ]]; then
+    DRY_RUN_RESULT="unparseable GitHub release metadata"
+    return 65
   fi
 
-  app_name=$(echo "$check_line" | cut -d'"' -f2)
-  source_repo=$(echo "$check_line" | cut -d'"' -f4)
-  app_lc=$(echo "${app_name,,}" | tr -d ' ')
-
-  if [[ -z "$source_repo" || "$source_repo" != *"/"* ]]; then
-    echo -e "${YW}[${mode_label}]${CL} Container $container ($service): cannot parse source repo — skipping"
-    DRY_RUN_RESULT="cannot parse source repo — skipping"
-    return
-  fi
-
-  # Read installed version from container (stored by check_for_gh_release as ~/.<appname>)
-  local current_version
-  current_version=$(pct exec "$container" -- bash -c "cat \$HOME/.${app_lc} 2>/dev/null" 2>/dev/null || true)
+  # check_for_gh_release records this version in the guest. It must be present
+  # and parseable before report-only can classify the update state.
+  current_version=$(pct exec "$container" -- bash -c "cat \$HOME/.${app_lc} 2>/dev/null" 2>/dev/null) || {
+    DRY_RUN_RESULT="cannot read installed GitHub-release version"
+    return 65
+  }
   current_version="${current_version#v}"
+  if ! valid_report_version "$current_version"; then
+    DRY_RUN_RESULT="unparseable installed GitHub-release version"
+    return 65
+  fi
 
-  # Query latest release from GitHub API
-  local latest_version
-  latest_version=$(curl -sSL --max-time 10 \
+  latest_version=$(curl -fsSL --max-time 10 \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
     "https://api.github.com/repos/${source_repo}/releases/latest" 2>/dev/null |
-    grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
-
-  if [[ -z "$latest_version" ]]; then
-    echo -e "${YW}[${mode_label}]${CL} Container $container ($service): cannot fetch latest version from $source_repo"
-    DRY_RUN_RESULT="cannot fetch latest version from $source_repo"
-    return
+    grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//') || {
+    DRY_RUN_RESULT="cannot fetch latest GitHub release from $source_repo"
+    return 65
+  }
+  if ! valid_report_version "$latest_version"; then
+    DRY_RUN_RESULT="unparseable latest GitHub release metadata from $source_repo"
+    return 65
   fi
 
-  if [[ -z "$current_version" ]]; then
-    echo -e "${BL}[${mode_label}]${CL} Container $container ($service): installed version unknown, latest: ${latest_version} (${source_repo})"
-    DRY_RUN_RESULT="version unknown — latest: ${latest_version}"
-  elif [[ "$current_version" == "$latest_version" ]]; then
+  if [[ "$current_version" == "$latest_version" ]]; then
     echo -e "${GN}[${mode_label}]${CL} Container $container ($service): up to date (${current_version})"
     DRY_RUN_RESULT="up to date (${current_version})"
   else
     echo -e "${YW}[${mode_label}]${CL} Container $container ($service): update available ${current_version} → ${latest_version}"
     DRY_RUN_RESULT="update available ${current_version} → ${latest_version}"
   fi
+}
+
+function report_cloudflared_apt() {
+  local container="$1" service="$2" mode_label="REPORT-ONLY"
+  local current_version policy candidate_version
+  current_version=$(pct exec "$container" -- dpkg-query -W -f='${Version}\n' cloudflared 2>/dev/null) || {
+    DRY_RUN_RESULT="cannot read installed cloudflared APT version"
+    return 65
+  }
+  policy=$(pct exec "$container" -- apt-cache policy cloudflared 2>/dev/null) || {
+    DRY_RUN_RESULT="cannot read cloudflared APT candidate"
+    return 65
+  }
+  candidate_version=$(awk '/^[[:space:]]*Candidate:/ { print $2; exit }' <<<"$policy")
+  if ! valid_report_version "$current_version" || ! valid_report_version "$candidate_version"; then
+    DRY_RUN_RESULT="unparseable cloudflared APT current or candidate version"
+    return 65
+  fi
+
+  if [[ "$current_version" == "$candidate_version" ]]; then
+    echo -e "${GN}[${mode_label}]${CL} Container $container ($service): up to date (${current_version})"
+    DRY_RUN_RESULT="up to date (${current_version})"
+  else
+    echo -e "${YW}[${mode_label}]${CL} Container $container ($service): update available ${current_version} → ${candidate_version}"
+    DRY_RUN_RESULT="update available ${current_version} → ${candidate_version}"
+  fi
+}
+
+function report_n8n_npm() {
+  local container="$1" service="$2" mode_label="REPORT-ONLY"
+  local current_version latest_version registry_json
+  current_version=$(pct exec "$container" -- n8n --version 2>/dev/null) || {
+    DRY_RUN_RESULT="cannot read installed n8n version"
+    return 65
+  }
+  registry_json=$(curl -fsSL --max-time 10 \
+    -H 'Accept: application/json' \
+    'https://registry.npmjs.org/n8n/latest' 2>/dev/null) || {
+    DRY_RUN_RESULT="cannot read latest n8n registry version"
+    return 65
+  }
+  latest_version=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' <<<"$registry_json" | head -1 | cut -d'"' -f4)
+  current_version="${current_version#v}"
+  latest_version="${latest_version#v}"
+  if ! valid_report_version "$current_version" || ! valid_report_version "$latest_version"; then
+    DRY_RUN_RESULT="unparseable n8n current or registry version"
+    return 65
+  fi
+
+  if [[ "$current_version" == "$latest_version" ]]; then
+    echo -e "${GN}[${mode_label}]${CL} Container $container ($service): up to date (${current_version})"
+    DRY_RUN_RESULT="up to date (${current_version})"
+  else
+    echo -e "${YW}[${mode_label}]${CL} Container $container ($service): update available ${current_version} → ${latest_version}"
+    DRY_RUN_RESULT="update available ${current_version} → ${latest_version}"
+  fi
+}
+
+function dry_run_container() {
+  local container="$1" service="$2"
+  DRY_RUN_RESULT=""
+  case "$service" in
+  cloudflared)
+    report_cloudflared_apt "$container" "$service"
+    ;;
+  n8n)
+    report_n8n_npm "$container" "$service"
+    ;;
+  *)
+    report_gh_release "$container" "$service"
+    ;;
+  esac
 }
 
 function backup_container() {
@@ -448,9 +519,17 @@ function report_only_container() {
   fi
 
   # This verifies the manifest digest and containment before the CT script is read.
-  validate_service_script "$service"
+  if ! validate_service_script "$service"; then
+    echo -e "${RD}[REPORT-ONLY]${CL} Container $container ($service): FAILED (artifact validation failed)"
+    log_result "$container" "$service" "FAILED" "Artifact validation failed"
+    return 65
+  fi
   script=$(<"$PHS_VERIFIED_ARTIFACT")
-  dry_run_container "$container" "$service"
+  if ! dry_run_container "$container" "$service"; then
+    echo -e "${RD}[REPORT-ONLY]${CL} Container $container ($service): FAILED (${DRY_RUN_RESULT:-unknown report metadata failure})"
+    log_result "$container" "$service" "FAILED" "${DRY_RUN_RESULT:-unknown report metadata failure}"
+    return 65
+  fi
   log_result "$container" "$service" "REPORT-ONLY" "${DRY_RUN_RESULT:-version check only}"
   return 0
 }

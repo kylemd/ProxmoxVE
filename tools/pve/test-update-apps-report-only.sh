@@ -17,6 +17,9 @@ printf '%s\n' \
   >"$ARTIFACT/misc/core.func"
 printf '%s\n' '# report-only test api helper' >"$ARTIFACT/misc/api.func"
 printf '%s\n' 'check_for_gh_release "Test App" "example/test-repo"' >"$ARTIFACT/ct/test-service.sh"
+printf '%s\n' '# cloudflared is reported through the configured APT source' >"$ARTIFACT/ct/cloudflared.sh"
+printf '%s\n' '# n8n is reported through global npm latest' >"$ARTIFACT/ct/n8n.sh"
+printf '%s\n' '# deliberately unsupported update metadata' >"$ARTIFACT/ct/unsupported.sh"
 
 cat >"$BIN/pct" <<'EOF'
 #!/usr/bin/env bash
@@ -24,15 +27,35 @@ printf '%s\n' "$1" >>"$PHS_TEST_CALLS"
 case "$1" in
 list) printf 'VMID NAME STATUS\n101 test running\n102 stopped stopped\n' ;;
 config) printf 'tags: community-script\nostype: debian\n' ;;
-status) [[ "$2" == 101 ]] && printf 'status: running\n' || printf 'status: stopped\n' ;;
-pull) printf '%s\n' '#!/usr/bin/env bash https://example.invalid/ct/test-service.sh' >"$4" ;;
-exec) printf '1.0.0\n' ;;
+status) [[ "$2" == 102 ]] && printf 'status: stopped\n' || printf 'status: running\n' ;;
+pull)
+  printf '%s\n' "$2" >>"$PHS_TEST_PULLS"
+  printf '#!/usr/bin/env bash https://example.invalid/ct/%s.sh\n' "${PHS_TEST_SERVICE:-test-service}" >"$4"
+  ;;
+exec)
+  case "$*" in
+  *dpkg-query*) [[ -n "${PHS_TEST_APT_CURRENT:-}" ]] || exit 73; printf '%s\n' "$PHS_TEST_APT_CURRENT" ;;
+  *apt-cache\ policy*) [[ -n "${PHS_TEST_APT_CANDIDATE:-}" ]] || exit 74; printf 'Installed: %s\nCandidate: %s\n' "${PHS_TEST_APT_CURRENT:-}" "$PHS_TEST_APT_CANDIDATE" ;;
+  *n8n\ --version*) [[ -n "${PHS_TEST_NPM_CURRENT:-}" ]] || exit 75; printf '%s\n' "$PHS_TEST_NPM_CURRENT" ;;
+  *bash\ -c*) [[ -n "${PHS_TEST_GH_CURRENT:-1.0.0}" ]] || exit 76; printf '%s\n' "${PHS_TEST_GH_CURRENT:-1.0.0}" ;;
+  *) printf 'unexpected pct exec: %s\n' "$*" >&2; exit 97 ;;
+  esac
+  ;;
 *) printf 'unexpected pct command: %s\n' "$1" >&2; exit 97 ;;
 esac
 EOF
 cat >"$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' '{"tag_name":"v1.1.0"}'
+case "$*" in
+*registry.npmjs.org/n8n/latest*)
+  printf '%s\n' 'registry n8n latest' >>"$PHS_TEST_REGISTRY_CALLS"
+  [[ "${PHS_TEST_NPM_FAIL:-no}" != yes ]] || exit 77
+  [[ -n "${PHS_TEST_NPM_LATEST:-}" ]] || exit 78
+  printf '{"version":"%s"}\n' "$PHS_TEST_NPM_LATEST"
+  ;;
+*api.github.com/repos/*/releases/latest*) printf '%s\n' '{"tag_name":"v1.1.0"}' ;;
+*) printf 'unexpected curl: %s\n' "$*" >&2; exit 98 ;;
+esac
 EOF
 cat >"$BIN/mkdir" <<'EOF'
 #!/usr/bin/env bash
@@ -44,14 +67,16 @@ chmod +x "$BIN/pct" "$BIN/curl" "$BIN/mkdir"
 write_manifest() {
   : >"$ARTIFACT/manifest.sha256"
   local path
-  for path in misc/core.func misc/api.func ct/test-service.sh; do
+  for path in misc/core.func misc/api.func ct/test-service.sh ct/cloudflared.sh ct/n8n.sh ct/unsupported.sh; do
     sha256sum "$ARTIFACT/$path" | awk -v p="$path" '{print $1 "  " p}' >>"$ARTIFACT/manifest.sha256"
   done
 }
 
 run_report() {
   PATH="$BIN:$PATH" PHS_TEST_CALLS="$CALLS" PHS_ARTIFACT_DIR="$ARTIFACT" \
-    PHS_ARTIFACT_MANIFEST=manifest.sha256 var_container=101,102 var_skip_confirm=yes \
+    PHS_TEST_REGISTRY_CALLS="$TEST_ROOT/registry-calls" PHS_TEST_PULLS="$TEST_ROOT/pulls" \
+    PHS_ARTIFACT_MANIFEST=manifest.sha256 \
+    var_container="${1:-101,102}" var_skip_confirm=yes \
     var_report_only=yes bash "$TARGET"
 }
 
@@ -70,6 +95,51 @@ grep -q 'SKIPPED (not running; it will not be started)' <<<"$output"
 : >"$CALLS"
 legacy_output=$(run_legacy_dry_run)
 grep -q 'REPORT-ONLY' <<<"$legacy_output"
+! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
+
+# GitHub release metadata is only successful when current and latest versions
+# are both established. Unsupported metadata must fail and be recorded FAILED.
+: >"$CALLS"
+: >"$TEST_ROOT/pulls"
+if unsupported_output=$(PHS_TEST_SERVICE=unsupported run_report 101,103 2>&1); then
+  printf '%s\n' 'expected unsupported metadata to fail closed' >&2
+  exit 1
+fi
+grep -q 'FAILED' <<<"$unsupported_output"
+grep -q 'unsupported update metadata' <<<"$unsupported_output"
+[[ "$(cat "$TEST_ROOT/pulls")" == 101 ]]
+! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
+
+# Cloudflared is APT-managed: report guest current and configured-source
+# candidate without apt update/install, and fail if either side is missing.
+: >"$CALLS"
+cloudflared_output=$(PHS_TEST_SERVICE=cloudflared PHS_TEST_APT_CURRENT=2026.7.2 PHS_TEST_APT_CANDIDATE=2026.8.0 run_report 101)
+grep -q 'update available 2026.7.2 → 2026.8.0' <<<"$cloudflared_output"
+! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
+: >"$CALLS"
+if cloudflared_missing_output=$(PHS_TEST_SERVICE=cloudflared PHS_TEST_APT_CURRENT=2026.7.2 run_report 101 2>&1); then
+  printf '%s\n' 'expected missing cloudflared candidate to fail closed' >&2
+  exit 1
+fi
+grep -q 'FAILED' <<<"$cloudflared_missing_output"
+grep -q 'cannot read cloudflared APT candidate' <<<"$cloudflared_missing_output"
+! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
+
+# n8n is npm-managed: report guest n8n --version and use a cache-free registry
+# GET for the latest version, avoiding npm's host cache/log writes.
+: >"$CALLS"
+: >"$TEST_ROOT/registry-calls"
+n8n_output=$(PHS_TEST_SERVICE=n8n PHS_TEST_NPM_CURRENT=1.100.0 PHS_TEST_NPM_LATEST=1.101.0 run_report 101)
+grep -q 'update available 1.100.0 → 1.101.0' <<<"$n8n_output"
+grep -qx 'registry n8n latest' "$TEST_ROOT/registry-calls"
+! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
+: >"$CALLS"
+if n8n_failure_output=$(PHS_TEST_SERVICE=n8n PHS_TEST_NPM_CURRENT=1.100.0 PHS_TEST_NPM_LATEST=1.101.0 PHS_TEST_NPM_FAIL=yes run_report 101 2>&1); then
+  printf '%s\n' 'expected n8n registry failure to fail closed' >&2
+  exit 1
+fi
+grep -q 'FAILED' <<<"$n8n_failure_output"
+grep -q 'cannot read latest n8n registry version' <<<"$n8n_failure_output"
 ! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
 
 # Explicit unattended execution must fail before loading remote helpers or
