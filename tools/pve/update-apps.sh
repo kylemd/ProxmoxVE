@@ -4,10 +4,6 @@
 # Author: BvdBerg01 | Co-Author: remz1337
 # License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
 
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/refs/heads/main/misc/core.func)
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/api.func) 2>/dev/null || true
-declare -f init_tool_telemetry &>/dev/null && init_tool_telemetry "update-apps" "pve"
-
 # =============================================================================
 # CONFIGURATION VARIABLES
 # Set these variables to skip interactive prompts (Whiptail dialogs)
@@ -44,18 +40,106 @@ var_auto_reboot="${var_auto_reboot:-}"
 
 # var_continue_on_error: Continue updating remaining containers if one update fails
 #   Options: "yes" | "no" (default: no = stop on first error)
-#   Note: containers with backups always attempt restore on failure regardless of this setting
+#   Note: a failed stateful update is quarantined; this tool never restores it automatically.
 var_continue_on_error="${var_continue_on_error:-no}"
 
-# var_dry_run: Check for available updates without applying them
+# var_report_only: Read already-verified local artifacts and report update availability.
 #   Options: "yes" | "no" (default: no)
-#   Output: lists each container with current vs. latest version
-#   Note: requires the container to be running; does not modify any container
+#   Requires PHS_ARTIFACT_DIR and PHS_ARTIFACT_MANIFEST. It never persistently
+#   mutates guests or the Proxmox host, and stopped guests are reported SKIPPED
+#   without starting. Read-only guest inspection may use a temporary host file.
+var_report_only="${var_report_only:-no}"
+
+# var_dry_run: Legacy compatibility alias for var_report_only.
+#   Options: "yes" | "no" (default: no)
 var_dry_run="${var_dry_run:-no}"
 
 # var_tags: Optionally override the tags used for auto-detection
 #   Options: "community-script|proxmox-helper-scripts" (default)
 var_tags="${var_tags:-community-script|proxmox-helper-scripts}"
+
+# PHS_ARTIFACT_DIR: Local trust root used only by var_report_only=yes.
+# PHS_ARTIFACT_MANIFEST: Manifest inside that root. Each non-empty line is:
+#   <64 lowercase-or-uppercase SHA256 hex characters><whitespace><relative path>
+# Required entries are misc/core.func, misc/api.func, and ct/<service>.sh. The
+# manifest and every referenced file must resolve under PHS_ARTIFACT_DIR.
+PHS_ARTIFACT_DIR="${PHS_ARTIFACT_DIR:-}"
+PHS_ARTIFACT_MANIFEST="${PHS_ARTIFACT_MANIFEST:-}"
+
+# Legacy dry-run is intentionally upgraded to the stricter report-only contract.
+if [[ "$var_dry_run" == "yes" ]]; then
+  var_report_only="yes"
+fi
+
+if [[ "$var_report_only" != "yes" && "$var_report_only" != "no" ]]; then
+  printf '%s\n' "ERROR: var_report_only must be yes or no" >&2
+  exit 64
+fi
+
+function artifact_fail() {
+  printf '%s\n' "ERROR: report-only artifact verification failed: $*" >&2
+  exit 65
+}
+
+function artifact_safe_relative_path() {
+  local relative_path="$1"
+  [[ "$relative_path" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || return 1
+  [[ "/$relative_path/" != *"/../"* && "$relative_path" != *"//"* ]] || return 1
+  return 0
+}
+
+function artifact_path_within_root() {
+  local candidate="$1"
+  local resolved
+  resolved=$(readlink -f -- "$candidate") || return 1
+  [[ -f "$resolved" && "$resolved" == "$PHS_ARTIFACT_ROOT/"* ]] || return 1
+  printf '%s\n' "$resolved"
+}
+
+function bootstrap_report_only_artifacts() {
+  [[ -n "$PHS_ARTIFACT_DIR" ]] || artifact_fail "PHS_ARTIFACT_DIR is required"
+  [[ -n "$PHS_ARTIFACT_MANIFEST" ]] || artifact_fail "PHS_ARTIFACT_MANIFEST is required"
+  PHS_ARTIFACT_ROOT=$(readlink -f -- "$PHS_ARTIFACT_DIR") || artifact_fail "artifact directory is not resolvable"
+  [[ -d "$PHS_ARTIFACT_ROOT" ]] || artifact_fail "artifact directory is not a directory"
+
+  local manifest_candidate
+  if [[ "$PHS_ARTIFACT_MANIFEST" == /* ]]; then
+    manifest_candidate="$PHS_ARTIFACT_MANIFEST"
+  else
+    manifest_candidate="$PHS_ARTIFACT_ROOT/$PHS_ARTIFACT_MANIFEST"
+  fi
+  PHS_ARTIFACT_MANIFEST_PATH=$(artifact_path_within_root "$manifest_candidate") || artifact_fail "manifest is missing or outside artifact directory"
+
+  verify_report_only_artifact "misc/core.func"
+  PHS_ARTIFACT_CORE="$PHS_VERIFIED_ARTIFACT"
+  verify_report_only_artifact "misc/api.func"
+  PHS_ARTIFACT_API="$PHS_VERIFIED_ARTIFACT"
+}
+
+function verify_report_only_artifact() {
+  local requested_path="$1" manifest_line expected_hash manifest_path actual_hash match_count=0
+  artifact_safe_relative_path "$requested_path" || artifact_fail "unsafe relative path '$requested_path'"
+
+  while IFS= read -r manifest_line || [[ -n "$manifest_line" ]]; do
+    [[ -z "$manifest_line" ]] && continue
+    if [[ ! "$manifest_line" =~ ^([[:xdigit:]]{64})[[:space:]]+([A-Za-z0-9][A-Za-z0-9._/-]*)$ ]]; then
+      artifact_fail "manifest line has invalid schema"
+    fi
+    expected_hash="${BASH_REMATCH[1],,}"
+    manifest_path="${BASH_REMATCH[2]}"
+    artifact_safe_relative_path "$manifest_path" || artifact_fail "manifest contains unsafe path '$manifest_path'"
+    if [[ "$manifest_path" == "$requested_path" ]]; then
+      ((match_count += 1))
+      [[ "$match_count" -eq 1 ]] || artifact_fail "manifest repeats '$requested_path'"
+      PHS_VERIFIED_ARTIFACT=$(artifact_path_within_root "$PHS_ARTIFACT_ROOT/$manifest_path") || artifact_fail "required '$requested_path' is missing or escapes artifact directory"
+      actual_hash=$(sha256sum -- "$PHS_VERIFIED_ARTIFACT" | awk '{print tolower($1)}') || artifact_fail "cannot hash '$requested_path'"
+      [[ "$actual_hash" == "$expected_hash" ]] || artifact_fail "digest mismatch for '$requested_path'"
+    fi
+  done <"$PHS_ARTIFACT_MANIFEST_PATH"
+
+  [[ "$match_count" -eq 1 ]] || artifact_fail "manifest has no digest for '$requested_path'"
+}
+
 # =============================================================================
 # JSON CONFIG EXPORT
 # Run with --export-config to output current configuration as JSON
@@ -71,6 +155,7 @@ function export_config_json() {
   "var_skip_confirm": "${var_skip_confirm}",
   "var_auto_reboot": "${var_auto_reboot}",
   "var_continue_on_error": "${var_continue_on_error}",
+  "var_report_only": "${var_report_only}",
   "var_dry_run": "${var_dry_run}",
   "var_tags": "${var_tags}"
 }
@@ -91,28 +176,27 @@ Environment Variables:
   var_backup          Enable backup before update (yes/no)
   var_backup_storage  Storage location for backups
   var_container       Container selection (all/all_running/all_stopped/101,102,...)
-  var_unattended         Run updates unattended (yes/no)
+  var_unattended         Run updates unattended (yes/no; currently fail-closed)
   var_skip_confirm       Skip initial confirmation (yes/no)
   var_auto_reboot        Auto-reboot containers if required (yes/no)
   var_continue_on_error  Continue to next container on update failure (yes/no)
-  var_dry_run            Check for updates without applying them (yes/no)
+  var_report_only        Zero-mutation report using verified local artifacts (yes/no)
+  var_dry_run            Legacy alias for var_report_only=yes
   var_tags               Optionally override auto-detection tags ("prod|smb|community-script")
+  PHS_ARTIFACT_DIR       Local report-only trust root
+  PHS_ARTIFACT_MANIFEST  SHA256 manifest path, relative to the trust root or absolute within it
 
 Examples:
   # Run interactively
   $(basename "$0")
 
-  # Update all running containers unattended with backup
-  var_backup=yes var_backup_storage=local var_container=all_running var_unattended=yes var_skip_confirm=yes $(basename "$0")
+  # Report-only: use an already verified local artifact bundle; no guest or host mutation
+  PHS_ARTIFACT_DIR=/srv/phs-artifacts PHS_ARTIFACT_MANIFEST=manifest.sha256 \
+    var_container=all_running var_skip_confirm=yes var_report_only=yes $(basename "$0")
 
-  # Update specific containers without backup
-  var_backup=no var_container=101,102,105 var_unattended=yes var_skip_confirm=yes $(basename "$0")
-
-  # Unattended cron-style: skip confirm, continue on error, no backup
-  var_backup=no var_container=all_running var_unattended=yes var_skip_confirm=yes var_continue_on_error=yes $(basename "$0")
-
-  # Dry-run: show available updates for all running containers without applying
-  var_container=all_running var_skip_confirm=yes var_dry_run=yes $(basename "$0")
+  # Legacy compatibility: var_dry_run enforces the same report-only trust-root contract
+  PHS_ARTIFACT_DIR=/srv/phs-artifacts PHS_ARTIFACT_MANIFEST=manifest.sha256 \
+    var_container=all_running var_skip_confirm=yes var_dry_run=yes $(basename "$0")
 
   # Export current configuration
   $(basename "$0") --export-config
@@ -130,6 +214,23 @@ case "${1:-}" in
   exit 0
   ;;
 esac
+
+# Report-only sources only verified local artifacts. Unattended live execution is
+# deliberately disabled until its disposable-LXC and verified guest-execution path exists.
+if [[ "$var_report_only" == "yes" ]]; then
+  bootstrap_report_only_artifacts
+  source "$PHS_ARTIFACT_CORE"
+  source "$PHS_ARTIFACT_API"
+elif [[ "$var_unattended" == "yes" ]]; then
+  printf '%s\n' "ERROR: unattended live updates are disabled: disposable-LXC validation and the verified guest execution path are not yet enabled." >&2
+  exit 65
+else
+  source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/refs/heads/main/misc/core.func)
+  source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/api.func) 2>/dev/null || true
+fi
+if [[ "$var_report_only" != "yes" ]]; then
+  declare -f init_tool_telemetry &>/dev/null && init_tool_telemetry "update-apps" "pve"
+fi
 
 # =============================================================================
 
@@ -157,6 +258,10 @@ function sanitize_service_name() {
 function validate_service_script() {
   local name="$1"
   sanitize_service_name "$name" || return 1
+  if [[ "$var_report_only" == "yes" ]]; then
+    verify_report_only_artifact "ct/${name}.sh"
+    return 0
+  fi
   curl -fsSL --max-time 10 -o /dev/null \
     "https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/${name}.sh" 2>/dev/null
 }
@@ -179,6 +284,7 @@ function detect_service() {
 function dry_run_container() {
   local container="$1"
   local service="$2"
+  local mode_label="REPORT-ONLY"
 
   # Extract app name and source repo directly from check_for_gh_release call in the ct script
   # Pattern: check_for_gh_release "appname" "owner/repo"
@@ -186,7 +292,7 @@ function dry_run_container() {
   check_line=$(echo "$script" | grep -m1 'check_for_gh_release')
 
   if [[ -z "$check_line" ]]; then
-    echo -e "${YW}[DRY-RUN]${CL} Container $container ($service): no check_for_gh_release found — skipping"
+    echo -e "${YW}[${mode_label}]${CL} Container $container ($service): no check_for_gh_release found — skipping"
     DRY_RUN_RESULT="no check_for_gh_release found — skipping"
     return
   fi
@@ -196,7 +302,7 @@ function dry_run_container() {
   app_lc=$(echo "${app_name,,}" | tr -d ' ')
 
   if [[ -z "$source_repo" || "$source_repo" != *"/"* ]]; then
-    echo -e "${YW}[DRY-RUN]${CL} Container $container ($service): cannot parse source repo — skipping"
+    echo -e "${YW}[${mode_label}]${CL} Container $container ($service): cannot parse source repo — skipping"
     DRY_RUN_RESULT="cannot parse source repo — skipping"
     return
   fi
@@ -215,19 +321,19 @@ function dry_run_container() {
     grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
 
   if [[ -z "$latest_version" ]]; then
-    echo -e "${YW}[DRY-RUN]${CL} Container $container ($service): cannot fetch latest version from $source_repo"
+    echo -e "${YW}[${mode_label}]${CL} Container $container ($service): cannot fetch latest version from $source_repo"
     DRY_RUN_RESULT="cannot fetch latest version from $source_repo"
     return
   fi
 
   if [[ -z "$current_version" ]]; then
-    echo -e "${BL}[DRY-RUN]${CL} Container $container ($service): installed version unknown, latest: ${latest_version} (${source_repo})"
+    echo -e "${BL}[${mode_label}]${CL} Container $container ($service): installed version unknown, latest: ${latest_version} (${source_repo})"
     DRY_RUN_RESULT="version unknown — latest: ${latest_version}"
   elif [[ "$current_version" == "$latest_version" ]]; then
-    echo -e "${GN}[DRY-RUN]${CL} Container $container ($service): up to date (${current_version})"
+    echo -e "${GN}[${mode_label}]${CL} Container $container ($service): up to date (${current_version})"
     DRY_RUN_RESULT="up to date (${current_version})"
   else
-    echo -e "${YW}[DRY-RUN]${CL} Container $container ($service): update available ${current_version} → ${latest_version}"
+    echo -e "${YW}[${mode_label}]${CL} Container $container ($service): update available ${current_version} → ${latest_version}"
     DRY_RUN_RESULT="update available ${current_version} → ${latest_version}"
   fi
 }
@@ -278,23 +384,108 @@ function log_result() {
   UPDATE_RESULTS+=("${1}|${2}|${3}|${4}")
 }
 
+function print_summary() {
+  [[ "${#UPDATE_RESULTS[@]}" -gt 0 ]] || return 0
+
+  local entry _ctid _svc _status _details _color
+  SEPARATOR="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  HEADER=$(printf "  %-8s  %-22s  %-14s  %s" "CTID" "Service" "Status" "Details")
+  echo ""
+  echo "$SEPARATOR"
+  echo "$HEADER"
+  echo "$SEPARATOR"
+  for entry in "${UPDATE_RESULTS[@]}"; do
+    IFS='|' read -r _ctid _svc _status _details <<<"$entry"
+    case "$_status" in
+    OK) _color="${GN}" ;;
+    FAILED | QUARANTINED | FAILED/QUARANTINED) _color="${RD}" ;;
+    *) _color="${YW}" ;;
+    esac
+    printf "  %-8s  %-22s  ${_color}%-14s${CL}  %s\n" "$_ctid" "$_svc" "$_status" "$_details"
+  done
+  echo "$SEPARATOR"
+  echo ""
+
+  # Report-only deliberately has no persistent log. Live interactive mode retains
+  # the historic log only after its separate, mutation-capable path is selected.
+  if [[ "$var_report_only" != "yes" ]]; then
+    echo "Full log: $LOG_FILE"
+    echo ""
+    {
+      echo ""
+      echo "Update finished: $(date '+%Y-%m-%d %H:%M:%S')"
+      echo "$SEPARATOR"
+      echo "$HEADER"
+      echo "$SEPARATOR"
+      for entry in "${UPDATE_RESULTS[@]}"; do
+        IFS='|' read -r _ctid _svc _status _details <<<"$entry"
+        printf "  %-8s  %-22s  %-14s  %s\n" "$_ctid" "$_svc" "$_status" "$_details"
+      done
+      echo "$SEPARATOR"
+    } >>"$LOG_FILE"
+  fi
+}
+
+function report_only_container() {
+  local container="$1" status
+
+  status=$(pct status "$container" 2>/dev/null || true)
+  if [[ "$status" != "status: running" ]]; then
+    echo -e "${YW}[REPORT-ONLY]${CL} Container $container: SKIPPED (not running; it will not be started)"
+    log_result "$container" "(not inspected)" "SKIPPED" "Not running; report-only never starts guests"
+    return 0
+  fi
+
+  if ! detect_service "$container" || [[ -z "$service" ]]; then
+    echo -e "${RD}[REPORT-ONLY]${CL} Container $container: FAILED (cannot read a service from /usr/bin/update)"
+    log_result "$container" "(unknown)" "FAILED" "Cannot read a service from /usr/bin/update"
+    return 65
+  fi
+  if ! sanitize_service_name "$service"; then
+    echo -e "${RD}[REPORT-ONLY]${CL} Container $container: FAILED (unsafe service filename)"
+    log_result "$container" "(unknown)" "FAILED" "Unsafe service filename from /usr/bin/update"
+    return 65
+  fi
+
+  # This verifies the manifest digest and containment before the CT script is read.
+  validate_service_script "$service"
+  script=$(<"$PHS_VERIFIED_ARTIFACT")
+  dry_run_container "$container" "$service"
+  log_result "$container" "$service" "REPORT-ONLY" "${DRY_RUN_RESULT:-version check only}"
+  return 0
+}
+
+function run_report_only() {
+  local container report_status=0
+  for container in $CHOICE; do
+    if ! report_only_container "$container"; then
+      report_status=65
+      # A trust/metadata failure is fail-closed even when continuation was requested.
+      return "$report_status"
+    fi
+  done
+  return "$report_status"
+}
+
 header_info
 
 # =============================================================================
 # LOGGING SETUP
-# Key events are written directly to a timestamped log file under
-# /usr/local/community-scripts/update_apps/ — this avoids any stdout
-# redirection that would break interactive spinners or whiptail dialogs.
-# The full summary table is appended at the end of the run.
+# Live interactive mode writes key events to a timestamped log. Report-only
+# mode leaves LOG_FILE empty and its logger is a no-op: it must create nothing.
 # =============================================================================
 LOG_DIR="/usr/local/community-scripts/update_apps"
-mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/$(date '+%Y%m%d_%H%M%S').log"
-echo "Update started: $(date '+%Y-%m-%d %H:%M:%S')" >"$LOG_FILE"
-
-function log_write() {
-  echo "[$(date '+%H:%M:%S')] $*" >>"$LOG_FILE"
-}
+LOG_FILE=""
+if [[ "$var_report_only" == "yes" ]]; then
+  function log_write() { :; }
+else
+  mkdir -p "$LOG_DIR"
+  LOG_FILE="${LOG_DIR}/$(date '+%Y%m%d_%H%M%S').log"
+  echo "Update started: $(date '+%Y-%m-%d %H:%M:%S')" >"$LOG_FILE"
+  function log_write() {
+    echo "[$(date '+%H:%M:%S')] $*" >>"$LOG_FILE"
+  }
+fi
 
 # Skip confirmation if var_skip_confirm is set to yes
 if [[ "$var_skip_confirm" != "yes" ]]; then
@@ -382,13 +573,21 @@ else
   fi
 fi
 
+if [[ "$var_report_only" == "yes" ]]; then
+  run_report_only
+  report_status=$?
+  header_info
+  echo -e "${GN}Report-only complete. No containers or host state were modified.${CL}\n"
+  print_summary
+  exit "$report_status"
+fi
+
 header_info
 
 # Determine backup choice based on var_backup
-# Dry-run never needs a backup — skip the prompt entirely
-if [[ "$var_dry_run" == "yes" ]]; then
-  BACKUP_CHOICE="no"
-elif [[ -n "$var_backup" ]]; then
+# Interactive legacy path only. Report-only exits above before backup, resource,
+# guest execution, shutdown/reboot, or persistent-log code can be reached.
+if [[ -n "$var_backup" ]]; then
   BACKUP_CHOICE="$var_backup"
 else
   BACKUP_CHOICE="no"
@@ -397,18 +596,10 @@ else
   fi
 fi
 
-# Determine unattended update based on var_unattended
-# Dry-run never executes updates — skip the prompt entirely
-if [[ "$var_dry_run" == "yes" ]]; then
-  UNATTENDED_UPDATE="no"
-elif [[ -n "$var_unattended" ]]; then
-  UNATTENDED_UPDATE="$var_unattended"
-else
-  UNATTENDED_UPDATE="no"
-  if (whiptail --backtitle "Proxmox VE Helper Scripts" --title "LXC Container Update" --yesno "Run updates unattended?" 10 58); then
-    UNATTENDED_UPDATE="yes"
-  fi
-fi
+# Silent guest execution is deliberately unavailable in every entry path until
+# the disposable-LXC proof and verified guest-execution contract exist. This
+# also closes the historical interactive prompt path, not only var_unattended.
+UNATTENDED_UPDATE="no"
 
 if [ "$BACKUP_CHOICE" == "yes" ]; then
   get_backup_storages
@@ -445,9 +636,6 @@ if [ "$BACKUP_CHOICE" == "yes" ]; then
 fi
 
 UPDATE_CMD="update;"
-if [ "$UNATTENDED_UPDATE" == "yes" ]; then
-  UPDATE_CMD="export PHS_SILENT=1;update;"
-fi
 
 containers_needing_reboot=()
 for container in $CHOICE; do
@@ -535,17 +723,8 @@ for container in $CHOICE; do
   fi
 
   #3) if build resources are different than run resources, then:
-  if [ "$UPDATE_BUILD_RESOURCES" -eq "1" ] && [[ "$var_dry_run" != "yes" ]]; then
+  if [ "$UPDATE_BUILD_RESOURCES" -eq "1" ]; then
     pct set "$container" --cores "$build_cpu" --memory "$build_ram"
-  fi
-
-  #3.5) Dry-run: report update availability without applying
-  if [[ "$var_dry_run" == "yes" ]]; then
-    DRY_RUN_RESULT=""
-    dry_run_container "$container" "$service"
-    log_result "$container" "$service" "DRY-RUN" "${DRY_RUN_RESULT:-version check only}"
-    log_write "Container $container ($service): DRY-RUN — ${DRY_RUN_RESULT:-version check only}"
-    continue
   fi
 
   #4) Update service, using the update command
@@ -593,39 +772,12 @@ for container in $CHOICE; do
     echo -e "${YW}[WARN]${CL} Container $container skipped (storage critically low on /boot)"
     log_result "$container" "$service" "SKIPPED" "Storage critically low on /boot (>80%)"
     log_write "Container $container ($service): SKIPPED — storage critically low on /boot"
-  elif [ "$BACKUP_CHOICE" == "yes" ]; then
-    msg_error "Update failed for container $container (exit code: $exit_code) — attempting restore"
-    log_write "Container $container ($service): FAILED (exit $exit_code) — attempting restore"
-    msg_info "Restoring LXC $container from backup ($STORAGE_CHOICE)"
-    pct stop $container
-    LXC_STORAGE=$(pct config $container | awk -F '[:,]' '/rootfs/ {print $2}')
-    BACKUP_ENTRY=$(pvesm list "$STORAGE_CHOICE" 2>/dev/null | awk -v ctid="$container" '$1 ~ "vzdump-lxc-"ctid"-" || $1 ~ "/ct/"ctid"/" {print $1}' | sort -r | head -n1)
-    if [ -z "$BACKUP_ENTRY" ]; then
-      msg_error "No backup found in storage $STORAGE_CHOICE for container $container"
-      log_result "$container" "$service" "FAILED" "Update failed (exit $exit_code) — no backup found for restore"
-      log_write "Container $container ($service): FAILED — no backup found for restore"
-      exit 235
-    fi
-    msg_info "Restoring from: $BACKUP_ENTRY"
-    pct restore $container "$BACKUP_ENTRY" --storage $LXC_STORAGE --force >/dev/null 2>&1
-    restorestatus=$?
-    if [ $restorestatus -eq 0 ]; then
-      pct start $container
-      msg_ok "Container $container successfully restored from backup"
-      log_result "$container" "$service" "RESTORED" "Update failed (exit $exit_code) — restored from backup"
-      log_write "Container $container ($service): RESTORED from $BACKUP_ENTRY"
-    else
-      msg_error "Restore failed for container $container"
-      log_result "$container" "$service" "FAILED" "Update failed (exit $exit_code) — restore also failed"
-      log_write "Container $container ($service): FAILED — restore also failed"
-      exit 235
-    fi
   else
-    msg_error "Update failed for container $container (exit code: $exit_code)"
-    log_result "$container" "$service" "FAILED" "Exit code $exit_code"
-    log_write "Container $container ($service): FAILED (exit $exit_code)"
+    msg_error "Update failed for container $container (exit code: $exit_code) — QUARANTINED; no automatic restore will be attempted"
+    log_result "$container" "$service" "FAILED/QUARANTINED" "Exit code $exit_code; inspect before manual recovery"
+    log_write "Container $container ($service): QUARANTINED (exit $exit_code); no automatic restore"
     if [[ "$var_continue_on_error" == "yes" ]]; then
-      echo -e "${YW}[WARN]${CL} Continuing to next container (var_continue_on_error=yes)"
+      echo -e "${YW}[WARN]${CL} Continuing to next container (var_continue_on_error=yes); failed guest remains quarantined"
       continue
     else
       exit "$exit_code"
@@ -635,53 +787,8 @@ done
 
 wait
 header_info
-if [[ "$var_dry_run" == "yes" ]]; then
-  echo -e "${GN}Dry-run complete. No containers were modified.${CL}\n"
-else
-  echo -e "${GN}The process is complete, and the containers have been successfully updated.${CL}\n"
-fi
-
-# =============================================================================
-# SUMMARY REPORT
-# =============================================================================
-if [ "${#UPDATE_RESULTS[@]}" -gt 0 ]; then
-  SEPARATOR="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  HEADER=$(printf "  %-8s  %-22s  %-10s  %s" "CTID" "Service" "Status" "Details")
-
-  # terminal output (with colours)
-  echo ""
-  echo "$SEPARATOR"
-  echo "$HEADER"
-  echo "$SEPARATOR"
-  for entry in "${UPDATE_RESULTS[@]}"; do
-    IFS='|' read -r _ctid _svc _status _details <<<"$entry"
-    case "$_status" in
-    OK) _color="${GN}" ;;
-    FAILED) _color="${RD}" ;;
-    RESTORED) _color="${YW}" ;;
-    *) _color="${YW}" ;;
-    esac
-    printf "  %-8s  %-22s  ${_color}%-10s${CL}  %s\n" "$_ctid" "$_svc" "$_status" "$_details"
-  done
-  echo "$SEPARATOR"
-  echo ""
-  echo "Full log: $LOG_FILE"
-  echo ""
-
-  # append plain-text summary to log file
-  {
-    echo ""
-    echo "Update finished: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "$SEPARATOR"
-    echo "$HEADER"
-    echo "$SEPARATOR"
-    for entry in "${UPDATE_RESULTS[@]}"; do
-      IFS='|' read -r _ctid _svc _status _details <<<"$entry"
-      printf "  %-8s  %-22s  %-10s  %s\n" "$_ctid" "$_svc" "$_status" "$_details"
-    done
-    echo "$SEPARATOR"
-  } >>"$LOG_FILE"
-fi
+echo -e "${GN}The process is complete, and the containers have been successfully updated.${CL}\n"
+print_summary
 if [ "${#containers_needing_reboot[@]}" -gt 0 ]; then
   echo -e "${RD}The following containers require a reboot:${CL}"
   for container_name in "${containers_needing_reboot[@]}"; do
