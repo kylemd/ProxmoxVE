@@ -14,6 +14,7 @@ INSTALLER_HELPER="$TEST_ROOT/installer-helper"
 UPDATER_HELPER="$TEST_ROOT/updater-helper"
 INSTALLER_SERVER="$TEST_ROOT/installer-server.mjs"
 UPDATER_SERVER="$TEST_ROOT/updater-server.mjs"
+UPDATER_EFFECTIVE_LIMIT_HELPER="$TEST_ROOT/updater-effective-limit.sh"
 CALLS="$TEST_ROOT/calls"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 mkdir -p "$BIN"
@@ -48,8 +49,8 @@ grep -qx 'WORKER_MAX_LIST_LIMIT=100' "$INSTALLER"
 [[ ! -e "$ROOT_DIR/ct/google-recorder-worker.sh" ]]
 
 # An update supplies the normal ceiling only when the setting is absent. The
-# existing-setting branch restarts the worker without invoking the helper, so
-# an operator-selected 1000 ceiling survives an in-place Community Script update.
+# existing-setting branch must preserve an operator-selected ceiling and verify
+# the effective value exposed by the non-sensitive health contract.
 update_limit_block=$(awk '
   /if ! grep -q '\''\^WORKER_MAX_LIST_LIMIT='\''/ { capture=1 }
   capture { print }
@@ -59,6 +60,21 @@ grep -Fq "if ! grep -q '^WORKER_MAX_LIST_LIMIT=' /etc/google-recorder-worker/wor
 grep -Fq '/usr/local/sbin/googlerecorderworker-limit 100' <<<"$update_limit_block"
 grep -Fq 'else' <<<"$update_limit_block"
 grep -Fq 'systemctl restart google-recorder-worker' <<<"$update_limit_block"
+grep -Fq 'wait_for_worker_effective_limit "$configured_limit"' <<<"$update_limit_block"
+grep -Fq 'Verified Worker List Ceiling: ${effective_limit}' <<<"$update_limit_block"
+! grep -Fq 'curl -fsS http://127.0.0.1:8787/health >/dev/null' <<<"$update_limit_block"
+
+awk '
+  /^function wait_for_worker_effective_limit\(\)/ { capture=1 }
+  capture {
+    print
+    opened=gsub(/\{/, "{")
+    closed=gsub(/\}/, "}")
+    depth+=opened-closed
+    if (depth == 0) exit
+  }
+' "$UPDATER" >"$UPDATER_EFFECTIVE_LIMIT_HELPER"
+grep -Fqx 'function wait_for_worker_effective_limit() {' "$UPDATER_EFFECTIVE_LIMIT_HELPER"
 
 sed \
   -e "s|/etc/google-recorder-worker/worker.env|$ENV_FILE|g" \
@@ -103,6 +119,11 @@ exit 0
 EOF
 chmod +x "$BIN/systemctl" "$BIN/curl" "$BIN/sleep" "$BIN/chown"
 
+run_update_effective_limit_check() {
+  PATH="$BIN:$PATH" PHS_TEST_ENV_FILE="$ENV_FILE" PHS_TEST_HEALTH_MODE="${1:?health mode required}" \
+    bash -c 'source "$1"; wait_for_worker_effective_limit "$2"' -- "$UPDATER_EFFECTIVE_LIMIT_HELPER" "${2:?limit required}"
+}
+
 write_env() {
   printf '%s\n' \
     'WORKER_TOKEN=preserved-test-token' \
@@ -131,6 +152,12 @@ run_helper() {
 }
 
 write_env duplicate
+: >"$CALLS"
+[[ "$(run_update_effective_limit_check match 1000)" == 1000 ]]
+if run_update_effective_limit_check mismatch 1000 >/dev/null 2>&1; then
+  printf '%s\n' 'expected update effective-ceiling mismatch to fail' >&2
+  exit 1
+fi
 : >"$CALLS"
 output=$(run_helper match 1000)
 grep -qx 'Google Recorder worker list ceiling: 1000' <<<"$output"

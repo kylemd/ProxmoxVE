@@ -287,19 +287,40 @@ function valid_report_version() {
 
 function report_gh_release() {
   local container="$1" service="$2" mode_label="REPORT-ONLY"
-  # Pattern: check_for_gh_release "appname" "owner/repo"
-  local check_line app_name app_lc source_repo current_version latest_version
+  # Literal metadata only: dynamic arguments cannot be inspected safely without
+  # executing the service script, which report-only intentionally never does.
+  local check_line call_suffix syntax_remainder app_name app_lc source_repo
+  local pinned_version tag_prefix release_url current_version latest_version
+  local -a release_args=()
   check_line=$(grep -m1 'check_for_gh_release' <<<"$script" || true)
   [[ -n "$check_line" ]] || {
     DRY_RUN_RESULT="unsupported update metadata: no check_for_gh_release declaration"
     return 65
   }
 
-  app_name=$(cut -d'"' -f2 <<<"$check_line")
-  source_repo=$(cut -d'"' -f4 <<<"$check_line")
+  call_suffix="${check_line#*check_for_gh_release}"
+  mapfile -t release_args < <(grep -oE '"[^"]*"' <<<"$call_suffix" | sed 's/^"//; s/"$//')
+  syntax_remainder=$(sed -E 's/"[^"]*"//g; s/[[:space:];]//g; s/then//g; s/#.*//g' <<<"$call_suffix")
+  if ((${#release_args[@]} < 2 || ${#release_args[@]} > 5)) || [[ -n "$syntax_remainder" ]]; then
+    DRY_RUN_RESULT="unsupported dynamic GitHub release metadata"
+    return 65
+  fi
+
+  app_name="${release_args[0]}"
+  source_repo="${release_args[1]}"
+  pinned_version="${release_args[2]:-}"
+  tag_prefix="${release_args[4]:-}"
+  if [[ "$app_name$source_repo$pinned_version$tag_prefix" == *'$'* || "$app_name$source_repo$pinned_version$tag_prefix" == *'`'* ]]; then
+    DRY_RUN_RESULT="unsupported dynamic GitHub release metadata"
+    return 65
+  fi
   app_lc=$(tr -d ' ' <<<"${app_name,,}")
   if [[ -z "$app_lc" || ! "$source_repo" =~ ^[[:alnum:]._-]+/[[:alnum:]._-]+$ ]]; then
     DRY_RUN_RESULT="unparseable GitHub release metadata"
+    return 65
+  fi
+  if [[ -n "$tag_prefix" && -z "$pinned_version" ]]; then
+    DRY_RUN_RESULT="unsupported GitHub tag-prefix metadata without a literal pinned version"
     return 65
   fi
 
@@ -315,12 +336,17 @@ function report_gh_release() {
     return 65
   fi
 
+  if [[ -n "$pinned_version" ]]; then
+    release_url="https://api.github.com/repos/${source_repo}/releases/tags/${pinned_version//\//%2F}"
+  else
+    release_url="https://api.github.com/repos/${source_repo}/releases/latest"
+  fi
   latest_version=$(curl -fsSL --max-time 10 \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
-    "https://api.github.com/repos/${source_repo}/releases/latest" 2>/dev/null |
+    "$release_url" 2>/dev/null |
     grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//') || {
-    DRY_RUN_RESULT="cannot fetch latest GitHub release from $source_repo"
+    DRY_RUN_RESULT="cannot fetch declared GitHub release from $source_repo"
     return 65
   }
   if ! valid_report_version "$latest_version"; then
@@ -500,11 +526,20 @@ function print_summary() {
 function report_only_container() {
   local container="$1" status
 
-  status=$(pct status "$container" 2>/dev/null || true)
-  if [[ "$status" != "status: running" ]]; then
+  status=$(pct status "$container" 2>/dev/null) || {
+    echo -e "${RD}[REPORT-ONLY]${CL} Container $container: FAILED (cannot determine container status)"
+    log_result "$container" "(not inspected)" "FAILED" "Cannot determine container status"
+    return 65
+  }
+  if [[ "$status" == "status: stopped" ]]; then
     echo -e "${YW}[REPORT-ONLY]${CL} Container $container: SKIPPED (not running; it will not be started)"
     log_result "$container" "(not inspected)" "SKIPPED" "Not running; report-only never starts guests"
     return 0
+  fi
+  if [[ "$status" != "status: running" ]]; then
+    echo -e "${RD}[REPORT-ONLY]${CL} Container $container: FAILED (unexpected container status)"
+    log_result "$container" "(not inspected)" "FAILED" "Unexpected container status: ${status:-empty}"
+    return 65
   fi
 
   if ! detect_service "$container" || [[ -z "$service" ]]; then

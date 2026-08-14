@@ -21,6 +21,22 @@ variables
 color
 catch_errors
 
+function wait_for_worker_effective_limit() {
+  local expected_limit="$1" health_response effective_limit
+
+  for _ in {1..15}; do
+    if health_response="$(curl -fsS http://127.0.0.1:8787/health)"; then
+      effective_limit="$(sed -nE 's/.*"worker_max_list_limit"[[:space:]]*:[[:space:]]*(1000|100).*/\1/p' <<<"$health_response")"
+      if [[ "$effective_limit" == "$expected_limit" ]]; then
+        printf '%s\n' "$effective_limit"
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 function update_script() {
   header_info
   check_container_storage
@@ -298,17 +314,17 @@ EOF
   if ! grep -q '^WORKER_MAX_LIST_LIMIT=' /etc/google-recorder-worker/worker.env; then
     /usr/local/sbin/googlerecorderworker-limit 100
   else
-    systemctl restart google-recorder-worker
-    for _ in {1..15}; do
-      if curl -fsS http://127.0.0.1:8787/health >/dev/null; then
-        break
-      fi
-      sleep 1
-    done
-    if ! curl -fsS http://127.0.0.1:8787/health >/dev/null; then
-      msg_error "Google Recorder worker health check failed"
+    configured_limit="$(sed -nE 's/^WORKER_MAX_LIST_LIMIT=(1000|100)$/\1/p' /etc/google-recorder-worker/worker.env)"
+    if [[ "$configured_limit" != "100" && "$configured_limit" != "1000" ]]; then
+      msg_error "Google Recorder worker configured list ceiling is invalid"
       exit 1
     fi
+    systemctl restart google-recorder-worker
+    if ! effective_limit="$(wait_for_worker_effective_limit "$configured_limit")"; then
+      msg_error "Google Recorder worker effective list ceiling check failed"
+      exit 1
+    fi
+    msg_ok "Verified Worker List Ceiling: ${effective_limit}"
   fi
   msg_ok "Repaired Worker Limit Control"
 

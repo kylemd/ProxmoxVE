@@ -20,6 +20,32 @@ variables
 color
 catch_errors
 
+function repair_nginx_tile_cache_sni() {
+  local nginx_config="${REITTI_NGINX_CONFIG:-/etc/nginx/nginx.conf}"
+  local changed=0
+
+  [[ -f "$nginx_config" ]] || return 0
+
+  if ! grep -q '^[[:space:]]*proxy_ssl_server_name on;' "$nginx_config"; then
+    sed -i '/proxy_set_header User-Agent "Reitti\/1.0";/a\      proxy_ssl_server_name on;' "$nginx_config" || return 1
+    changed=1
+  fi
+  if ! grep -q '^[[:space:]]*proxy_ssl_name \$proxy_host;' "$nginx_config"; then
+    sed -i '/proxy_ssl_server_name on;/a\      proxy_ssl_name $proxy_host;' "$nginx_config" || return 1
+    changed=1
+  fi
+
+  grep -q '^[[:space:]]*proxy_ssl_server_name on;' "$nginx_config" && \
+    grep -q '^[[:space:]]*proxy_ssl_name \$proxy_host;' "$nginx_config" || return 1
+
+  if ((changed)); then
+    msg_info "Repairing nginx tile cache TLS SNI configuration"
+    nginx -t || return 1
+    systemctl reload nginx || return 1
+    msg_ok "Repaired nginx tile cache TLS SNI configuration"
+  fi
+}
+
 function update_script() {
   header_info
   check_container_storage
@@ -236,6 +262,11 @@ NGINXEOF
       systemctl reload nginx
       msg_ok "Updated nginx tile cache configuration"
     fi
+  fi
+
+  if ! repair_nginx_tile_cache_sni; then
+    msg_error "Could not repair nginx tile cache TLS SNI configuration"
+    exit 1
   fi
 
   if check_for_gh_release "reitti" "dedicatedcode/reitti"; then

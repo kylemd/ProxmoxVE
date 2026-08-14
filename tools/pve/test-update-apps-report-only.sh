@@ -17,6 +17,8 @@ printf '%s\n' \
   >"$ARTIFACT/misc/core.func"
 printf '%s\n' '# report-only test api helper' >"$ARTIFACT/misc/api.func"
 printf '%s\n' 'check_for_gh_release "Test App" "example/test-repo"' >"$ARTIFACT/ct/test-service.sh"
+printf '%s\n' 'check_for_gh_release "Pinned App" "example/pinned-repo" "v1.0.5" "held for verification"' >"$ARTIFACT/ct/pinned-service.sh"
+printf '%s\n' 'check_for_gh_release "Dynamic App" "example/dynamic-repo" "$DYNAMIC_PIN"' >"$ARTIFACT/ct/dynamic-service.sh"
 printf '%s\n' '# cloudflared is reported through the configured APT source' >"$ARTIFACT/ct/cloudflared.sh"
 printf '%s\n' '# n8n is reported through global npm latest' >"$ARTIFACT/ct/n8n.sh"
 printf '%s\n' '# deliberately unsupported update metadata' >"$ARTIFACT/ct/unsupported.sh"
@@ -27,7 +29,14 @@ printf '%s\n' "$1" >>"$PHS_TEST_CALLS"
 case "$1" in
 list) printf 'VMID NAME STATUS\n101 test running\n102 stopped stopped\n' ;;
 config) printf 'tags: community-script\nostype: debian\n' ;;
-status) [[ "$2" == 102 ]] && printf 'status: stopped\n' || printf 'status: running\n' ;;
+  status)
+    printf 'status:%s\n' "$2" >>"$PHS_TEST_CALLS"
+    if [[ "$2" == "${PHS_TEST_STATUS_ERROR_VMID:-}" ]]; then
+      printf 'container status is unavailable\n' >&2
+      exit 88
+    fi
+    [[ "$2" == 102 ]] && printf 'status: stopped\n' || printf 'status: running\n'
+    ;;
 pull)
   printf '%s\n' "$2" >>"$PHS_TEST_PULLS"
   printf '#!/usr/bin/env bash https://example.invalid/ct/%s.sh\n' "${PHS_TEST_SERVICE:-test-service}" >"$4"
@@ -53,7 +62,14 @@ case "$*" in
   [[ -n "${PHS_TEST_NPM_LATEST:-}" ]] || exit 78
   printf '{"version":"%s"}\n' "$PHS_TEST_NPM_LATEST"
   ;;
-*api.github.com/repos/*/releases/latest*) printf '%s\n' '{"tag_name":"v1.1.0"}' ;;
+*api.github.com/repos/*/releases/tags/v1.0.5*)
+  printf '%s\n' "$*" >>"$PHS_TEST_GH_RELEASE_CALLS"
+  printf '%s\n' '{"tag_name":"v1.0.5"}'
+  ;;
+*api.github.com/repos/*/releases/latest*)
+  printf '%s\n' "$*" >>"$PHS_TEST_GH_RELEASE_CALLS"
+  printf '%s\n' '{"tag_name":"v1.1.0"}'
+  ;;
 *) printf 'unexpected curl: %s\n' "$*" >&2; exit 98 ;;
 esac
 EOF
@@ -67,14 +83,14 @@ chmod +x "$BIN/pct" "$BIN/curl" "$BIN/mkdir"
 write_manifest() {
   : >"$ARTIFACT/manifest.sha256"
   local path
-  for path in misc/core.func misc/api.func ct/test-service.sh ct/cloudflared.sh ct/n8n.sh ct/unsupported.sh; do
+  for path in misc/core.func misc/api.func ct/test-service.sh ct/pinned-service.sh ct/dynamic-service.sh ct/cloudflared.sh ct/n8n.sh ct/unsupported.sh; do
     sha256sum "$ARTIFACT/$path" | awk -v p="$path" '{print $1 "  " p}' >>"$ARTIFACT/manifest.sha256"
   done
 }
 
 run_report() {
   PATH="$BIN:$PATH" PHS_TEST_CALLS="$CALLS" PHS_ARTIFACT_DIR="$ARTIFACT" \
-    PHS_TEST_REGISTRY_CALLS="$TEST_ROOT/registry-calls" PHS_TEST_PULLS="$TEST_ROOT/pulls" \
+    PHS_TEST_REGISTRY_CALLS="$TEST_ROOT/registry-calls" PHS_TEST_GH_RELEASE_CALLS="$TEST_ROOT/gh-release-calls" PHS_TEST_PULLS="$TEST_ROOT/pulls" \
     PHS_ARTIFACT_MANIFEST=manifest.sha256 \
     var_container="${1:-101,102}" var_skip_confirm=yes \
     var_report_only=yes bash "$TARGET"
@@ -92,6 +108,20 @@ grep -q 'REPORT-ONLY' <<<"$output"
 grep -q 'SKIPPED (not running; it will not be started)' <<<"$output"
 ! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push)$' "$CALLS"
 ! grep -qx 'mkdir' "$CALLS"
+
+# A status lookup failure (including a missing guest) is not a skipped guest.
+# Report-only stops before it can inspect a later requested container.
+: >"$CALLS"
+: >"$TEST_ROOT/pulls"
+if status_error_output=$(PHS_TEST_STATUS_ERROR_VMID=101 run_report 101,103 2>&1); then
+  printf '%s\n' 'expected container status lookup failure to fail closed' >&2
+  exit 1
+fi
+grep -q 'FAILED (cannot determine container status)' <<<"$status_error_output"
+grep -qx 'status:101' "$CALLS"
+! grep -qx 'status:103' "$CALLS"
+[[ ! -s "$TEST_ROOT/pulls" ]]
+! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
 : >"$CALLS"
 legacy_output=$(run_legacy_dry_run)
 grep -q 'REPORT-ONLY' <<<"$legacy_output"
@@ -108,6 +138,25 @@ fi
 grep -q 'FAILED' <<<"$unsupported_output"
 grep -q 'unsupported update metadata' <<<"$unsupported_output"
 [[ "$(cat "$TEST_ROOT/pulls")" == 101 ]]
+! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
+
+# Literal pinned release metadata must query that exact tag, not generic latest.
+: >"$CALLS"
+: >"$TEST_ROOT/gh-release-calls"
+pinned_output=$(PHS_TEST_SERVICE=pinned-service run_report 101)
+grep -q 'update available 1.0.0 → 1.0.5' <<<"$pinned_output"
+grep -q 'releases/tags/v1.0.5' "$TEST_ROOT/gh-release-calls"
+! grep -q 'releases/latest' "$TEST_ROOT/gh-release-calls"
+! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
+
+# Dynamic pins cannot be evaluated without executing the service script, so
+# report-only must reject them rather than falling back to generic latest.
+: >"$CALLS"
+if dynamic_output=$(PHS_TEST_SERVICE=dynamic-service run_report 101 2>&1); then
+  printf '%s\n' 'expected dynamic GitHub release metadata to fail closed' >&2
+  exit 1
+fi
+grep -q 'unsupported dynamic GitHub release metadata' <<<"$dynamic_output"
 ! grep -Eq '^(start|stop|shutdown|reboot|set|restore|push|mkdir)$' "$CALLS"
 
 # Cloudflared is APT-managed: report guest current and configured-source
