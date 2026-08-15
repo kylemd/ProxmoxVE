@@ -66,6 +66,35 @@ var_tags="${var_tags:-community-script|proxmox-helper-scripts}"
 PHS_ARTIFACT_DIR="${PHS_ARTIFACT_DIR:-}"
 PHS_ARTIFACT_MANIFEST="${PHS_ARTIFACT_MANIFEST:-}"
 
+# `pct pull` needs a host-side file for inspection. Keep every directory that
+# is live at once in an exit-cleanup list so an interrupted report cannot leave
+# a host artifact behind. The cleanup preserves the original process status.
+declare -a PHS_PULL_TMPDIRS=()
+
+function cleanup_pull_tmpdirs() {
+  local exit_status=$? tmpdir
+  trap - EXIT INT TERM
+  for tmpdir in "${PHS_PULL_TMPDIRS[@]}"; do
+    rm -rf -- "$tmpdir" || true
+  done
+  return "$exit_status"
+}
+
+function release_pull_tmpdir() {
+  local tmpdir="$1" index
+  rm -rf -- "$tmpdir" || true
+  for index in "${!PHS_PULL_TMPDIRS[@]}"; do
+    if [[ "${PHS_PULL_TMPDIRS[$index]}" == "$tmpdir" ]]; then
+      unset 'PHS_PULL_TMPDIRS[index]'
+      break
+    fi
+  done
+}
+
+trap cleanup_pull_tmpdirs EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # Legacy dry-run is intentionally upgraded to the stricter report-only contract.
 if [[ "$var_dry_run" == "yes" ]]; then
   var_report_only="yes"
@@ -270,15 +299,16 @@ function detect_service() {
   local container="$1"
   local tmpdir update_file
   service=""
-  tmpdir=$(mktemp -d)
+  tmpdir=$(mktemp -d) || return 1
+  PHS_PULL_TMPDIRS+=("$tmpdir")
   update_file="$tmpdir/update"
   pct pull "$container" /usr/bin/update "$update_file" 2>/dev/null || true
   if [[ ! -s "$update_file" ]]; then
-    rm -rf "$tmpdir"
+    release_pull_tmpdir "$tmpdir"
     return 1
   fi
   service=$(grep -oE '/ct/[a-zA-Z0-9._-]+\.sh' "$update_file" 2>/dev/null | head -n1 | sed 's|.*/ct/||; s|\.sh$||')
-  rm -rf "$tmpdir"
+  release_pull_tmpdir "$tmpdir"
 }
 
 function valid_report_version() {

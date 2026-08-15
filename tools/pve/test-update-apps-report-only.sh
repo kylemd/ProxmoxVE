@@ -40,6 +40,10 @@ config) printf 'tags: community-script\nostype: debian\n' ;;
 pull)
   printf '%s\n' "$2" >>"$PHS_TEST_PULLS"
   printf '#!/usr/bin/env bash https://example.invalid/ct/%s.sh\n' "${PHS_TEST_SERVICE:-test-service}" >"$4"
+  if [[ "${PHS_TEST_TERMINATE_PULL:-no}" == yes ]]; then
+    printf '%s\n' "$(dirname -- "$4")" >"$PHS_TEST_TEMP_DIR_RECORD"
+    kill -TERM "$PPID"
+  fi
   ;;
 exec)
   case "$*" in
@@ -212,6 +216,22 @@ dispatch_block=$(awk '
 grep -q 'exit "$report_status"' <<<"$dispatch_block"
 ! grep -Eq 'pct (start|stop|shutdown|reboot|set|restore|push)|vzdump|mkdir -p|update;' <<<"$dispatch_block"
 ! grep -Eq 'pct restore|restore --force' "$TARGET"
+
+# A TERM while pct pull owns its per-guest host directory must preserve the
+# signal status and remove the directory through the EXIT cleanup path.
+termination_output="$TEST_ROOT/termination-output"
+termination_tempdir_record="$TEST_ROOT/termination-tempdir"
+set +e
+TMPDIR="$TEST_ROOT" PHS_TEST_TERMINATE_PULL=yes \
+  PHS_TEST_TEMP_DIR_RECORD="$termination_tempdir_record" run_report 101 \
+  >"$termination_output" 2>&1
+termination_status=$?
+set -e
+[[ "$termination_status" -eq 143 ]]
+[[ -s "$termination_tempdir_record" ]]
+terminated_tmpdir=$(<"$termination_tempdir_record")
+[[ "$terminated_tmpdir" == "$TEST_ROOT/"* ]]
+[[ ! -e "$terminated_tmpdir" ]]
 
 first_hash=$(awk 'NR == 1 {print substr($1, 1, 1)}' "$ARTIFACT/manifest.sha256")
 [[ "$first_hash" == 0 ]] && replacement=1 || replacement=0
