@@ -40,9 +40,11 @@ config) printf 'tags: community-script\nostype: debian\n' ;;
 pull)
   printf '%s\n' "$2" >>"$PHS_TEST_PULLS"
   printf '#!/usr/bin/env bash https://example.invalid/ct/%s.sh\n' "${PHS_TEST_SERVICE:-test-service}" >"$4"
-  if [[ "${PHS_TEST_TERMINATE_PULL:-no}" == yes ]]; then
+  if [[ -n "${PHS_TEST_TEMP_DIR_RECORD:-}" ]]; then
     printf '%s\n' "$(dirname -- "$4")" >"$PHS_TEST_TEMP_DIR_RECORD"
-    kill -TERM "$PPID"
+  fi
+  if [[ -n "${PHS_TEST_PULL_SIGNAL:-}" ]]; then
+    kill -s "$PHS_TEST_PULL_SIGNAL" "$PPID"
   fi
   ;;
 exec)
@@ -82,7 +84,15 @@ cat >"$BIN/mkdir" <<'EOF'
 printf '%s\n' 'mkdir' >>"$PHS_TEST_CALLS"
 exec /bin/mkdir "$@"
 EOF
-chmod +x "$BIN/pct" "$BIN/curl" "$BIN/mkdir"
+cat >"$BIN/rm" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${PHS_TEST_FAIL_RM:-no}" == yes && "$*" == *"${PHS_TEST_FAIL_RM_ROOT}"* && ! -e "${PHS_TEST_FAIL_RM_MARKER}" ]]; then
+  : >"$PHS_TEST_FAIL_RM_MARKER"
+  exit 71
+fi
+exec /bin/rm "$@"
+EOF
+chmod +x "$BIN/pct" "$BIN/curl" "$BIN/mkdir" "$BIN/rm"
 
 write_manifest() {
   : >"$ARTIFACT/manifest.sha256"
@@ -95,6 +105,8 @@ write_manifest() {
 run_report() {
   PATH="$BIN:$PATH" PHS_TEST_CALLS="$CALLS" PHS_ARTIFACT_DIR="$ARTIFACT" \
     PHS_TEST_REGISTRY_CALLS="$TEST_ROOT/registry-calls" PHS_TEST_GH_RELEASE_CALLS="$TEST_ROOT/gh-release-calls" PHS_TEST_PULLS="$TEST_ROOT/pulls" \
+    PHS_TEST_TEMP_DIR_RECORD="${PHS_TEST_TEMP_DIR_RECORD:-}" PHS_TEST_PULL_SIGNAL="${PHS_TEST_PULL_SIGNAL:-}" \
+    PHS_TEST_FAIL_RM="${PHS_TEST_FAIL_RM:-no}" PHS_TEST_FAIL_RM_ROOT="${PHS_TEST_FAIL_RM_ROOT:-}" PHS_TEST_FAIL_RM_MARKER="${PHS_TEST_FAIL_RM_MARKER:-}" \
     PHS_ARTIFACT_MANIFEST=manifest.sha256 \
     var_container="${1:-101,102}" var_skip_confirm=yes \
     var_report_only=yes bash "$TARGET"
@@ -217,21 +229,49 @@ grep -q 'exit "$report_status"' <<<"$dispatch_block"
 ! grep -Eq 'pct (start|stop|shutdown|reboot|set|restore|push)|vzdump|mkdir -p|update;' <<<"$dispatch_block"
 ! grep -Eq 'pct restore|restore --force' "$TARGET"
 
-# A TERM while pct pull owns its per-guest host directory must preserve the
-# signal status and remove the directory through the EXIT cleanup path.
-termination_output="$TEST_ROOT/termination-output"
-termination_tempdir_record="$TEST_ROOT/termination-tempdir"
+# A signal while pct pull owns its per-guest host directory must preserve its
+# status and remove the directory through the EXIT cleanup path.
+assert_signal_cleanup() {
+  local signal="$1" expected_status="$2" output tempdir_record tempdir status
+  output="$TEST_ROOT/${signal,,}-output"
+  tempdir_record="$TEST_ROOT/${signal,,}-tempdir"
+  set +e
+  TMPDIR="$TEST_ROOT" PHS_TEST_PULL_SIGNAL="$signal" \
+    PHS_TEST_TEMP_DIR_RECORD="$tempdir_record" run_report 101 >"$output" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -eq "$expected_status" ]]
+  [[ -s "$tempdir_record" ]]
+  tempdir=$(<"$tempdir_record")
+  [[ "$tempdir" == "$TEST_ROOT/"* ]]
+  [[ ! -e "$tempdir" ]]
+}
+
+assert_signal_cleanup TERM 143
+assert_signal_cleanup INT 130
+
+# A normal cleanup failure must fail the report and retain the directory for
+# EXIT cleanup, which succeeds on its second deterministic removal attempt.
+cleanup_failure_output="$TEST_ROOT/cleanup-failure-output"
+cleanup_failure_tempdir_record="$TEST_ROOT/cleanup-failure-tempdir"
+cleanup_failure_marker="$TEST_ROOT/cleanup-failure-marker"
 set +e
-TMPDIR="$TEST_ROOT" PHS_TEST_TERMINATE_PULL=yes \
-  PHS_TEST_TEMP_DIR_RECORD="$termination_tempdir_record" run_report 101 \
-  >"$termination_output" 2>&1
-termination_status=$?
+TMPDIR="$TEST_ROOT" PHS_TEST_FAIL_RM=yes PHS_TEST_FAIL_RM_ROOT="$TEST_ROOT" \
+  PHS_TEST_FAIL_RM_MARKER="$cleanup_failure_marker" \
+  PHS_TEST_TEMP_DIR_RECORD="$cleanup_failure_tempdir_record" run_report 101 \
+  >"$cleanup_failure_output" 2>&1
+cleanup_failure_status=$?
 set -e
-[[ "$termination_status" -eq 143 ]]
-[[ -s "$termination_tempdir_record" ]]
-terminated_tmpdir=$(<"$termination_tempdir_record")
-[[ "$terminated_tmpdir" == "$TEST_ROOT/"* ]]
-[[ ! -e "$terminated_tmpdir" ]]
+[[ "$cleanup_failure_status" -eq 65 ]]
+grep -q 'failed to remove report-only temporary host directory' "$cleanup_failure_output"
+[[ -e "$cleanup_failure_marker" ]]
+[[ -s "$cleanup_failure_tempdir_record" ]] || {
+  printf '%s\n' 'expected cleanup-failure tempdir record' >&2
+  exit 1
+}
+cleanup_failure_tmpdir=$(<"$cleanup_failure_tempdir_record")
+[[ "$cleanup_failure_tmpdir" == "$TEST_ROOT/"* ]]
+[[ ! -e "$cleanup_failure_tmpdir" ]]
 
 first_hash=$(awk 'NR == 1 {print substr($1, 1, 1)}' "$ARTIFACT/manifest.sha256")
 [[ "$first_hash" == 0 ]] && replacement=1 || replacement=0

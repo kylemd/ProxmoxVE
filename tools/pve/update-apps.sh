@@ -75,14 +75,19 @@ function cleanup_pull_tmpdirs() {
   local exit_status=$? tmpdir
   trap - EXIT INT TERM
   for tmpdir in "${PHS_PULL_TMPDIRS[@]}"; do
-    rm -rf -- "$tmpdir" || true
+    if ! rm -rf -- "$tmpdir"; then
+      printf '%s\n' "ERROR: failed to remove report-only temporary host directory '$tmpdir' during exit cleanup" >&2
+    fi
   done
   return "$exit_status"
 }
 
 function release_pull_tmpdir() {
   local tmpdir="$1" index
-  rm -rf -- "$tmpdir" || true
+  if ! rm -rf -- "$tmpdir"; then
+    printf '%s\n' "ERROR: failed to remove report-only temporary host directory '$tmpdir'" >&2
+    return 70
+  fi
   for index in "${!PHS_PULL_TMPDIRS[@]}"; do
     if [[ "${PHS_PULL_TMPDIRS[$index]}" == "$tmpdir" ]]; then
       unset 'PHS_PULL_TMPDIRS[index]'
@@ -304,11 +309,14 @@ function detect_service() {
   update_file="$tmpdir/update"
   pct pull "$container" /usr/bin/update "$update_file" 2>/dev/null || true
   if [[ ! -s "$update_file" ]]; then
-    release_pull_tmpdir "$tmpdir"
+    release_pull_tmpdir "$tmpdir" || return 70
     return 1
   fi
   service=$(grep -oE '/ct/[a-zA-Z0-9._-]+\.sh' "$update_file" 2>/dev/null | head -n1 | sed 's|.*/ct/||; s|\.sh$||')
-  release_pull_tmpdir "$tmpdir"
+  if ! release_pull_tmpdir "$tmpdir"; then
+    service=""
+    return 70
+  fi
 }
 
 function valid_report_version() {
